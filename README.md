@@ -1,10 +1,12 @@
 # gramps-sql-extensions
 
-SQL-accelerated implementations of operations Gramps normally performs by
-walking Python objects. The first (and so far only) piece is fast
-relationship lookup.
+A collection of SQL-accelerated implementations of operations Gramps
+normally performs by walking Python objects. Each module targets one such
+operation. So far:
 
-## Why
+- **Relationship lookup** (`gramps_sql_extensions.relationship`)
+
+## Relationship lookup
 
 Gramps' own `RelationshipCalculator` finds the relationship between two
 people by recursively walking `Person`/`Family` objects and enumerating
@@ -31,9 +33,9 @@ Privacy filtering (mirroring `PrivateProxyDb`'s rules: a private person, a
 private family, or a private `ChildRef` are all invisible) is a live SQL
 predicate, not a second precomputed copy of the graph.
 
-## Usage
+### Usage
 
-This package has no idea what your database connection is. It needs
+This module has no idea what your database connection is. It needs
 exactly one thing from you: an `execute` callable.
 
 ```python
@@ -59,17 +61,6 @@ each time. See `RelationshipGraph.__init__`'s docstring for the full
 contract, including `treeid` (for a multi-tenant Postgres schema; `None`
 for one-tree-per-file SQLite).
 
-## Status
-
-Extracted from a real, tested integration into
-[gramps-web-api](https://github.com/gramps-project/gramps-web-api).
-Validated (in that integration) against live Postgres and SQLite
-databases, including the pedigree-collapse tie-break, remarriage
-ordering, and privacy filtering, and against gramps-web-api's own
-`tests/test_endpoints/test_relations.py`. Not yet independently packaged,
-versioned, or tested standalone, this scaffold is the first step toward
-that.
-
 ## License
 
-AGPL-3.0-or-later, matching Gramps and Gramps Web API.
+AGPL-3.0-or-later, matching Gramps.

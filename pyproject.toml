@@ -13,8 +13,11 @@ dependencies = [
     "gramps",
 ]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [project.urls]
-Homepage = "https://github.com/gramps-project"
+Homepage = "https://github.com/dsblank/gramps-sql-extensions"
 
 [tool.setuptools.packages.find]
 where = ["src"]
