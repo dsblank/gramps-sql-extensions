@@ -1,0 +1,49 @@
+"""Tests for the `restricted` privacy-filtering path, mirroring gramps-
+core's PrivateProxyDb: a private person, a private family, or a private
+ChildRef are each individually invisible to a restricted viewer, and
+nothing else should be. See conftest.py's `privacy_db` for the three
+minimal cases constructed for this (example.gramps doesn't reliably
+exercise any of them, so this doesn't rely on finding one there).
+"""
+
+
+def test_private_person_hidden_when_restricted(privacy_graph):
+    graph, h = privacy_graph
+    # the private parent (mother1) is invisible to a restricted viewer
+    unrestricted, _, _ = graph.relationship(h["child1"], h["mother1"], restricted=False)
+    restricted, _, _ = graph.relationship(h["child1"], h["mother1"], restricted=True)
+    assert unrestricted == "mother"
+    assert restricted == ""
+
+
+def test_private_person_does_not_hide_other_parent(privacy_graph):
+    graph, h = privacy_graph
+    # the *other* parent (father1) isn't private and must stay visible,
+    # even though mother1 in the same family is
+    unrestricted, _, _ = graph.relationship(h["child1"], h["father1"], restricted=False)
+    restricted, _, _ = graph.relationship(h["child1"], h["father1"], restricted=True)
+    assert unrestricted == restricted == "father"
+
+
+def test_private_family_hidden_when_restricted(privacy_graph):
+    graph, h = privacy_graph
+    unrestricted, _, _ = graph.relationship(h["child2"], h["father2"], restricted=False)
+    restricted, _, _ = graph.relationship(h["child2"], h["father2"], restricted=True)
+    assert unrestricted == "father"
+    assert restricted == ""
+
+
+def test_private_childref_hidden_when_restricted(privacy_graph):
+    graph, h = privacy_graph
+    unrestricted, _, _ = graph.relationship(h["child3"], h["father3"], restricted=False)
+    restricted, _, _ = graph.relationship(h["child3"], h["father3"], restricted=True)
+    assert unrestricted == "father"
+    assert restricted == ""
+
+
+def test_all_relationships_respects_privacy(privacy_graph):
+    graph, h = privacy_graph
+    assert graph.all_relationships(h["child1"], h["mother1"], restricted=True) == [{}]
+    assert graph.all_relationships(h["child1"], h["mother1"], restricted=False)[0][
+        "relationship_string"
+    ] == "mother"
