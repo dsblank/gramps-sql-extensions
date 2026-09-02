@@ -63,4 +63,4 @@ for one-tree-per-file SQLite).
 
 ## License
 
-AGPL-3.0-or-later, matching Gramps.
+GPL-2.0-or-later, matching Gramps.

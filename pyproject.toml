@@ -7,7 +7,7 @@ name = "gramps-sql-extensions"
 version = "0.1.0"
 description = "SQL-accelerated implementations of Gramps operations, starting with fast relationship lookup."
 readme = "README.md"
-license = { text = "AGPL-3.0-or-later" }
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
     "gramps",
