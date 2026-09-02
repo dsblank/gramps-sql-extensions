@@ -61,6 +61,33 @@ each time. See `RelationshipGraph.__init__`'s docstring for the full
 contract, including `treeid` (for a multi-tenant Postgres schema; `None`
 for one-tree-per-file SQLite).
 
+### Public-only search (`restricted=True`)
+
+Both `relationship()` and `all_relationships()` take a `restricted`
+keyword, `False` by default. Pass `restricted=True` when the caller
+shouldn't see anyone's private data, e.g. an anonymous or logged-out
+visitor to a public family tree site. It mirrors `PrivateProxyDb`'s three
+rules exactly: a private person, a private family, or a private
+`ChildRef` all make that link invisible, as if it didn't exist in the
+graph at all — not merely redacted after the fact.
+
+```python
+# A logged-in owner sees everything:
+graph.relationship(h1, h2, restricted=False)  # e.g. "mother"
+
+# The same query from a public, unauthenticated viewer:
+graph.relationship(h1, h2, restricted=True)   # "" if the only path
+                                               # runs through a private
+                                               # person/family/child link
+```
+
+Because the check is a live SQL predicate applied on every call rather
+than a second precomputed "restricted" copy of the graph, marking someone
+private takes effect on the very next query, with nothing to invalidate.
+This is what a Gramps Web-style deployment should use for any relationship
+lookup made on behalf of a non-owner viewer; use `restricted=False` only
+for callers already authorized to see private data.
+
 ## License
 
 GPL-2.0-or-later, matching Gramps.
