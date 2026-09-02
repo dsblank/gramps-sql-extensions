@@ -9,6 +9,8 @@ package is installed.
 
 import os
 
+import _gi_stub  # noqa: F401  -- must run before any `gramps` import, see that module
+
 import pytest
 from gramps.gen.db import DbTxn
 from gramps.gen.db.utils import make_database
