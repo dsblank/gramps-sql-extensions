@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gramps-sql-extensions"
+version = "0.1.0"
+description = "SQL-accelerated implementations of Gramps operations, starting with fast relationship lookup."
+readme = "README.md"
+license = { text = "AGPL-3.0-or-later" }
+requires-python = ">=3.10"
+dependencies = [
+    "gramps",
+]
+
+[project.urls]
+Homepage = "https://github.com/gramps-project"
+
+[tool.setuptools.packages.find]
+where = ["src"]
