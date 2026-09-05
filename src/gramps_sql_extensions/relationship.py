@@ -218,12 +218,28 @@ class RelationshipGraph:
 
     # -- graph extraction -----------------------------------------------
 
-    def ancestor_map(self, handle: str, restricted: bool, max_depth: int = 15):
-        """Return (dist, path, parent_of) for every ancestor of `handle`
-        reachable within `max_depth` generations. `dist`/`path` cover only
-        the *shortest* route to each ancestor (the visited-once BFS
-        invariant that avoids the exponential blowup); `parent_of` carries
-        every edge actually fetched, needed by `sibling_type` below."""
+    def ancestor_map(self, handle: str, restricted: bool, max_depth: int = 15) -> dict:
+        """Return a dict describing every ancestor of `handle` reachable
+        within `max_depth` generations, keyed:
+
+        - `"dist"`: handle -> generation distance from `handle` (shortest
+          route only -- the visited-once BFS invariant that avoids the
+          exponential blowup).
+        - `"path"`: handle -> path code string for that same shortest
+          route (e.g. `"ffMf"`).
+        - `"prev"`: handle -> the one child it was discovered from along
+          that shortest route, letting a caller (see `relationship_path`)
+          reconstruct the actual chain of handles rather than just its
+          length/wording.
+        - `"parent_of"`: child handle -> list of `(parent, code,
+          relvalue)` edges actually fetched (every edge, not just
+          shortest-route ones), needed by `sibling_type`.
+
+        A dict, not a tuple, deliberately: this is a public method with
+        no fixed arity to preserve, and a caller reading `m["dist"]`
+        keeps working if a later version adds a new key (e.g. gender,
+        family_handle) -- unlike positional unpacking, which breaks the
+        moment the shape grows."""
         d = self._dialect
         t_pp = _tree_clause("pp", self._treeid)
         t_ff = _tree_clause("ff", self._treeid)
@@ -284,6 +300,7 @@ class RelationshipGraph:
         # gets found here when the real endpoint would report "not related".
         dist = {handle: 0}
         path = {handle: ""}
+        prev: dict[str, Optional[str]] = {handle: None}
         frontier = [handle]
         depth = 0
         while frontier and depth < max_depth - 1:
@@ -294,9 +311,10 @@ class RelationshipGraph:
                     if parent not in dist:
                         dist[parent] = depth
                         path[parent] = path[h] + code
+                        prev[parent] = h
                         nxt.append(parent)
             frontier = nxt
-        return dist, path, parent_of
+        return {"dist": dist, "path": path, "prev": prev, "parent_of": parent_of}
 
     def ensure_child_of(self) -> None:
         """(Re)build the session temp table `ancestor_map` reads from. Call
@@ -454,6 +472,46 @@ class RelationshipGraph:
             return _HALF_SIB_FATHER if (f2 and f2 == f1) else _STEP_SIB
         return _UNKNOWN_SIB
 
+    @staticmethod
+    def _ancestor_sort_key(dist1, path1, dist2, path2, h):
+        """Full ordering over candidate common ancestors, low (best) to
+        high: nearer total generation-distance first; among ties,
+        gramps-core's own priority order (direct relation > birth-line >
+        mother-line-over-father-line, matching (Ga, Gb, gender,
+        only_birth)-dependent English wording); finally the handle
+        itself, purely so that ties surviving even that (genuinely
+        interchangeable in wording) still sort the same way on every
+        call rather than depending on `set` iteration order, which is
+        hash-seed-dependent and not stable across processes. Shared by
+        `_best_common_ancestor` (single best) and `all_relationship_paths`
+        (every candidate, nearest first) so the first entry of the
+        latter always agrees with the former's pick."""
+        p1, p2 = path1[h], path2[h]
+        direct = dist1[h] == 0 or dist2[h] == 0
+        birth = _is_birth_path(p1) and _is_birth_path(p2)
+        code_rank = {"m": 0, "f": 1, "M": 2, "F": 3}
+        c1 = code_rank.get(p1[-1], -1) if p1 else -1
+        c2 = code_rank.get(p2[-1], -1) if p2 else -1
+        return (dist1[h] + dist2[h], not direct, not birth, c1, c2, h)
+
+    @classmethod
+    def _best_common_ancestor(cls, dist1, path1, dist2, path2, common):
+        """Pedigree-collapse tie-break shared by `relationship()` and
+        `relationship_path()`: the single nearest/best common ancestor,
+        per `_ancestor_sort_key`."""
+        return min(common, key=lambda h: cls._ancestor_sort_key(dist1, path1, dist2, path2, h))
+
+    @staticmethod
+    def _chain_to_ancestor(prev: dict, anc: str) -> list[str]:
+        """Walk `prev` (i.e. `ancestor_map(...)["prev"]`) from `anc` back
+        to the handle its map was built for, returning handles in root ->
+        `anc` order."""
+        chain = [anc]
+        while prev[chain[-1]] is not None:
+            chain.append(prev[chain[-1]])
+        chain.reverse()
+        return chain
+
     # -- shared wording helper ---------------------------------------------
 
     def _string_for_ancestor(self, h1, h2, anc, dist1, path1, pm1, dist2, path2, pm2, gender1, gender2) -> str:
@@ -487,34 +545,15 @@ class RelationshipGraph:
             rel_str = self._calc.get_partner_relationship_string(spouse_type, gender1, gender2)
             return rel_str, -1, -1
 
-        dist1, path1, pm1 = self.ancestor_map(h1, restricted, max_depth=depth)
-        dist2, path2, pm2 = self.ancestor_map(h2, restricted, max_depth=depth)
+        m1 = self.ancestor_map(h1, restricted, max_depth=depth)
+        m2 = self.ancestor_map(h2, restricted, max_depth=depth)
+        dist1, path1, pm1 = m1["dist"], m1["path"], m1["parent_of"]
+        dist2, path2, pm2 = m2["dist"], m2["path"], m2["parent_of"]
         common = set(dist1) & set(dist2)
         if not common:
             return "", -1, -1
 
-        # Pedigree-collapse tie-break: among common ancestors tied at the
-        # global-minimum generation distance, prefer direct relation >
-        # birth-line > mother-line-over-father-line -- matching gramps-
-        # core's priority order without needing collapse_relations'
-        # literal family-index-list merge (English wording depends only on
-        # (Ga, Gb, gender, only_birth), never the raw path string, so
-        # merging two person-paths into one family-path can't change the
-        # output; only which candidate "wins" the tie can).
-        min_rank = min(dist1[h] + dist2[h] for h in common)
-        tied = [h for h in common if dist1[h] + dist2[h] == min_rank]
-
-        code_rank = {"m": 0, "f": 1, "M": 2, "F": 3}
-
-        def tie_key(h):
-            p1, p2 = path1[h], path2[h]
-            direct = dist1[h] == 0 or dist2[h] == 0
-            birth = _is_birth_path(p1) and _is_birth_path(p2)
-            c1 = code_rank.get(p1[-1], -1) if p1 else -1
-            c2 = code_rank.get(p2[-1], -1) if p2 else -1
-            return (not direct, not birth, c1, c2)
-
-        best = min(tied, key=tie_key)
+        best = self._best_common_ancestor(dist1, path1, dist2, path2, common)
         Ga, Gb = dist1[best], dist2[best]
         gender1, gender2 = self.gender(h1), self.gender(h2)
         rel_str = self._string_for_ancestor(h1, h2, best, dist1, path1, pm1, dist2, path2, pm2, gender1, gender2)
@@ -552,8 +591,10 @@ class RelationshipGraph:
             seen[rel_str] = len(result)
             result.append({"relationship_string": rel_str, "common_ancestors": []})
 
-        dist1, path1, pm1 = self.ancestor_map(h1, restricted, max_depth=depth)
-        dist2, path2, pm2 = self.ancestor_map(h2, restricted, max_depth=depth)
+        m1 = self.ancestor_map(h1, restricted, max_depth=depth)
+        m2 = self.ancestor_map(h2, restricted, max_depth=depth)
+        dist1, path1, pm1 = m1["dist"], m1["path"], m1["parent_of"]
+        dist2, path2, pm2 = m2["dist"], m2["path"], m2["parent_of"]
         common = set(dist1) & set(dist2)
         if not common:
             return result or [{}]
@@ -570,3 +611,201 @@ class RelationshipGraph:
                 result.append({"relationship_string": rel_str, "common_ancestors": [anc]})
 
         return result or [{}]
+
+    def _relationship_to(self, h1: str, other: str, restricted: bool, depth: int, dist1, path1, pm1) -> str:
+        """Relationship of `other` to `h1`, reusing `h1`'s already-built
+        ancestor map (`dist1`/`path1`/`pm1`) rather than recomputing it --
+        the piece of `relationship()` that's expensive per call and, for
+        `relationship_path()` below, is the same for every node along the
+        chain. Only `other`'s own map is fetched fresh each call."""
+        spouse = self.check_spouse(h1, other, restricted)
+        if spouse is not None:
+            spouse_type, gender1, gender2 = spouse
+            return self._calc.get_partner_relationship_string(spouse_type, gender1, gender2)
+
+        m2 = self.ancestor_map(other, restricted, max_depth=depth)
+        dist2, path2, pm2 = m2["dist"], m2["path"], m2["parent_of"]
+        common = set(dist1) & set(dist2)
+        if not common:
+            return ""
+
+        anc = self._best_common_ancestor(dist1, path1, dist2, path2, common)
+        gender1, gender2 = self.gender(h1), self.gender(other)
+        return self._string_for_ancestor(h1, other, anc, dist1, path1, pm1, dist2, path2, pm2, gender1, gender2)
+
+    def _label_direct_ancestor(self, h1: str, node: str, dist1, path1, gender1: int) -> str:
+        """Relationship to `h1` of `node`, one of `h1`'s own ancestors
+        (present in `h1`'s ancestor map `dist1`/`path1`) -- the common
+        ancestor of this particular pairing is `node` itself, so Gb is
+        always 0, e.g. `get_single_relationship_string(2, 0, ...)` ->
+        "grandfather"/"grandmother"."""
+        gender_node = self.gender(node)
+        only_birth = _is_birth_path(path1[node])
+        return self._calc.get_single_relationship_string(
+            dist1[node], 0, gender1, gender_node, path1[node], "",
+            only_birth=only_birth, in_law_a=False, in_law_b=False,
+        )
+
+    def _label_via_ancestor(self, h1: str, other: str, anc: str, dist1, path1, pm1, dist2, path2, pm2, gender1: int) -> str:
+        """Relationship to `h1` of `other`, an ancestor of `h2` (or `h2`
+        itself) sitting on `h2`'s shortest BFS route to the specific
+        common ancestor `anc`. `other`'s own up-path to `anc` is the tail
+        of `anc`'s own `path2`/distance beyond `other`'s -- valid only
+        because `other` sits on that exact route (true for every node
+        `all_relationship_paths`/`relationship_path` ever call this for),
+        not for an arbitrary pair of ancestors in the map."""
+        Ga = dist1[anc]
+        Gb = dist2[anc] - dist2[other]
+        path_a = path1[anc]
+        path_b = path2[anc][len(path2[other]):]
+        gender_other = self.gender(other)
+        if Ga == 1 and Gb == 1:
+            sib = self.sibling_type(h1, other, pm1, pm2)
+            return self._calc.get_sibling_relationship_string(sib, gender1, gender_other)
+        only_birth = _is_birth_path(path_a) and _is_birth_path(path_b)
+        return self._calc.get_single_relationship_string(
+            Ga, Gb, gender1, gender_other, path_a, path_b,
+            only_birth=only_birth, in_law_a=False, in_law_b=False,
+        )
+
+    @staticmethod
+    def _chain_pair(prev1, prev2, anc):
+        """The two half-chains meeting at `anc`: `([h1, ..., anc], [h2,
+        ..., anc])`, per `_chain_to_ancestor`."""
+        return (
+            RelationshipGraph._chain_to_ancestor(prev1, anc),
+            RelationshipGraph._chain_to_ancestor(prev2, anc),
+        )
+
+    def relationship_path(self, h1: str, h2: str, restricted: bool = False, depth: int = 15):
+        """Return the chain of people connecting `h1` and `h2` through
+        their nearest common ancestor -- the same pairing `relationship()`
+        reports -- as a list of `{"handle", "relationship_string"}` dicts
+        ordered from `h1` to `h2` inclusive. Meant for drawing a
+        relationship graph/chain: each dict is one node, consecutive
+        dicts are its edges, and `relationship_string` is always that
+        node's relationship *to `h1`* (e.g. "father", "grandmother",
+        "second great stepgrandaunt"), not to its neighbor in the chain --
+        so `h1`'s own entry is always `""` (it's the reference person
+        every other entry's wording is relative to).
+
+        Returns `[]` if `h1` and `h2` aren't related within `depth`
+        generations, or `[{"handle": h1, "relationship_string": ""}]` if
+        they're the same person.
+        """
+        if h1 == h2:
+            return [{"handle": h1, "relationship_string": ""}]
+
+        self.ensure_child_of()
+
+        result = [{"handle": h1, "relationship_string": ""}]
+
+        spouse = self.check_spouse(h1, h2, restricted)
+        if spouse is not None:
+            spouse_type, gender1, gender2 = spouse
+            rel_str = self._calc.get_partner_relationship_string(spouse_type, gender1, gender2)
+            result.append({"handle": h2, "relationship_string": rel_str})
+            return result
+
+        m1 = self.ancestor_map(h1, restricted, max_depth=depth)
+        m2 = self.ancestor_map(h2, restricted, max_depth=depth)
+        dist1, path1, prev1, pm1 = m1["dist"], m1["path"], m1["prev"], m1["parent_of"]
+        dist2, path2, prev2, pm2 = m2["dist"], m2["path"], m2["prev"], m2["parent_of"]
+        common = set(dist1) & set(dist2)
+        if not common:
+            return []
+
+        anc = self._best_common_ancestor(dist1, path1, dist2, path2, common)
+
+        chain1 = self._chain_to_ancestor(prev1, anc)  # [h1, ..., anc]
+        chain2 = self._chain_to_ancestor(prev2, anc)  # [h2, ..., anc]
+        nodes = chain1 + list(reversed(chain2[:-1]))  # h1 .. anc .. h2
+
+        for node in nodes[1:]:
+            rel_str = self._relationship_to(h1, node, restricted, depth, dist1, path1, pm1)
+            result.append({"handle": node, "relationship_string": rel_str})
+
+        return result
+
+    def all_relationship_paths(
+        self, h1: str, h2: str, restricted: bool = False, depth: int = 15, max_paths: Optional[int] = None
+    ):
+        """Return every distinct chain of people connecting `h1` and `h2`,
+        one per common ancestor, nearest-relationship-first -- the
+        `relationship_path()` analogue of how `all_relationships()`
+        relates to `relationship()`. Unlike `all_relationships()`, this
+        groups by ancestor rather than by wording: two different
+        ancestors that happen to produce identical wording still come
+        back as two separate paths here, since the whole point is
+        showing the actual distinct routes between the two people, not
+        just how many different ways to say it there are.
+
+        Each entry has the same shape `relationship_path()` returns: a
+        list of `{"handle", "relationship_string"}` dicts from `h1` to
+        `h2`, each node's string relative to `h1`.
+
+        `max_paths` caps how many paths are returned (nearest first) --
+        `None` (the default) returns all of them, matching
+        `all_relationships()`'s own uncapped behavior, but pedigree
+        collapse can produce a common ancestor for every generation two
+        people's lines happen to cross, so pass a small `max_paths` when
+        you only want the first handful for display. Paths are ordered
+        so that `all_relationship_paths(...)[0]` always equals
+        `relationship_path(...)`.
+
+        Under heavy pedigree collapse the *same* person can legitimately
+        appear twice within one path -- once as `h1`'s own ancestor and
+        again, independently, as an ancestor of `h2`'s route to a more
+        distant common ancestor through that same person's spouse. That
+        isn't a bug: it reflects the two people's lines genuinely
+        crossing more than once, the same real-world situation
+        `all_relationships()` reports as more than one distinct
+        `relationship_string` for the same pair.
+
+        Returns `[]` if `h1` and `h2` aren't related within `depth`
+        generations, and `[[{"handle": h1, "relationship_string": ""}]]`
+        (a single trivial one-node "path") if they're the same person.
+        """
+        if h1 == h2:
+            return [[{"handle": h1, "relationship_string": ""}]]
+
+        self.ensure_child_of()
+
+        paths = []
+
+        spouse = self.check_spouse(h1, h2, restricted)
+        if spouse is not None:
+            spouse_type, gender1, gender2 = spouse
+            rel_str = self._calc.get_partner_relationship_string(spouse_type, gender1, gender2)
+            paths.append([
+                {"handle": h1, "relationship_string": ""},
+                {"handle": h2, "relationship_string": rel_str},
+            ])
+
+        m1 = self.ancestor_map(h1, restricted, max_depth=depth)
+        m2 = self.ancestor_map(h2, restricted, max_depth=depth)
+        dist1, path1, prev1, pm1 = m1["dist"], m1["path"], m1["prev"], m1["parent_of"]
+        dist2, path2, prev2, pm2 = m2["dist"], m2["path"], m2["prev"], m2["parent_of"]
+        common = set(dist1) & set(dist2)
+        if not common:
+            return paths
+
+        gender1 = self.gender(h1)
+        ancestors = sorted(common, key=lambda h: self._ancestor_sort_key(dist1, path1, dist2, path2, h))
+        if max_paths is not None:
+            ancestors = ancestors[:max_paths]
+
+        for anc in ancestors:
+            chain1, chain2 = self._chain_pair(prev1, prev2, anc)  # [h1,...,anc], [h2,...,anc]
+
+            path = [{"handle": h1, "relationship_string": ""}]
+            for node in chain1[1:]:
+                rel_str = self._label_direct_ancestor(h1, node, dist1, path1, gender1)
+                path.append({"handle": node, "relationship_string": rel_str})
+            for node in reversed(chain2[:-1]):
+                rel_str = self._label_via_ancestor(h1, node, anc, dist1, path1, pm1, dist2, path2, pm2, gender1)
+                path.append({"handle": node, "relationship_string": rel_str})
+
+            paths.append(path)
+
+        return paths

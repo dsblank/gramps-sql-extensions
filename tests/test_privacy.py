@@ -47,3 +47,19 @@ def test_all_relationships_respects_privacy(privacy_graph):
     assert graph.all_relationships(h["child1"], h["mother1"], restricted=False)[0][
         "relationship_string"
     ] == "mother"
+
+
+def test_relationship_path_respects_privacy(privacy_graph):
+    graph, h = privacy_graph
+    assert graph.relationship_path(h["child1"], h["mother1"], restricted=True) == []
+    unrestricted = graph.relationship_path(h["child1"], h["mother1"], restricted=False)
+    assert [node["handle"] for node in unrestricted] == [h["child1"], h["mother1"]]
+    assert unrestricted[-1]["relationship_string"] == "mother"
+
+
+def test_all_relationship_paths_respects_privacy(privacy_graph):
+    graph, h = privacy_graph
+    assert graph.all_relationship_paths(h["child1"], h["mother1"], restricted=True) == []
+    unrestricted = graph.all_relationship_paths(h["child1"], h["mother1"], restricted=False)
+    assert len(unrestricted) == 1
+    assert unrestricted[0][-1]["relationship_string"] == "mother"

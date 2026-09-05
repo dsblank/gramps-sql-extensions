@@ -80,6 +80,101 @@ def test_all_relationships_locale(make_graph):
     assert result[0]["relationship_string"] == "Stief-/Adoptivalttante"
 
 
+def test_relationship_path_expected_result(graph):
+    path = graph.relationship_path("9BXKQC1PVLPYFMD6IX", "ORFKQC4KLWEGTGR19L")
+    assert [node["handle"] for node in path] == [
+        "9BXKQC1PVLPYFMD6IX",
+        "HKTJQCIJD8RK9RJFO1",
+        "TDTJQCGYRS2RCCGQN3",
+        "DPUJQCUYKKDPT78JJV",
+        "GNUJQCL9MD64AM56OH",
+        "46WJQCIOLQ0KOX2XCC",
+        "ORFKQC4KLWEGTGR19L",
+    ]
+    assert [node["relationship_string"] for node in path] == [
+        "",
+        "father",
+        "grandfather",
+        "great grandfather",
+        "second great grandfather",
+        "third great stepgrandmother",
+        "second great stepgrandaunt",
+    ]
+    # the last entry always matches relationship()'s own answer
+    rel_str, _, _ = graph.relationship("9BXKQC1PVLPYFMD6IX", "ORFKQC4KLWEGTGR19L")
+    assert path[-1]["relationship_string"] == rel_str
+
+
+def test_relationship_path_same_person(graph):
+    assert graph.relationship_path("9BXKQC1PVLPYFMD6IX", "9BXKQC1PVLPYFMD6IX") == [
+        {"handle": "9BXKQC1PVLPYFMD6IX", "relationship_string": ""}
+    ]
+
+
+def test_relationship_path_unrelated(graph):
+    assert graph.relationship_path("9BXKQC1PVLPYFMD6IX", "ORFKQC4KLWEGTGR19L", depth=5) == []
+
+
+def test_relationship_path_partner(graph):
+    path = graph.relationship_path("cc8205d87831c772e87", "cc8205d872f532ab14e")
+    assert path == [
+        {"handle": "cc8205d87831c772e87", "relationship_string": ""},
+        {"handle": "cc8205d872f532ab14e", "relationship_string": "husband"},
+    ]
+
+
+def test_all_relationship_paths_expected_result(graph):
+    h1, h2 = "9BXKQC1PVLPYFMD6IX", "ORFKQC4KLWEGTGR19L"
+    paths = graph.all_relationship_paths(h1, h2)
+    # 6 distinct common ancestors -> 6 distinct paths, matching the 6
+    # ancestors all_relationships() groups into its 2 wording buckets
+    assert len(paths) == 6
+    # nearest-first, and the very first path always matches the single
+    # "best" answer relationship_path()/relationship() report
+    assert paths[0] == graph.relationship_path(h1, h2)
+    assert paths[0][-1]["relationship_string"] == graph.relationship(h1, h2)[0]
+    # every path starts at h1 (with the trivial self entry) and ends at h2
+    for path in paths:
+        assert path[0] == {"handle": h1, "relationship_string": ""}
+        assert path[-1]["handle"] == h2
+
+
+def test_all_relationship_paths_max_paths(graph):
+    h1, h2 = "9BXKQC1PVLPYFMD6IX", "ORFKQC4KLWEGTGR19L"
+    full = graph.all_relationship_paths(h1, h2)
+    capped = graph.all_relationship_paths(h1, h2, max_paths=2)
+    assert capped == full[:2]
+
+
+def test_all_relationship_paths_order_is_deterministic(graph):
+    """Ancestor ordering must not depend on `set` iteration order (which
+    is hash-seed-dependent) -- repeated calls must agree."""
+    h1, h2 = "9BXKQC1PVLPYFMD6IX", "ORFKQC4KLWEGTGR19L"
+    first = graph.all_relationship_paths(h1, h2)
+    for _ in range(5):
+        assert graph.all_relationship_paths(h1, h2) == first
+
+
+def test_all_relationship_paths_same_person(graph):
+    assert graph.all_relationship_paths("9BXKQC1PVLPYFMD6IX", "9BXKQC1PVLPYFMD6IX") == [
+        [{"handle": "9BXKQC1PVLPYFMD6IX", "relationship_string": ""}]
+    ]
+
+
+def test_all_relationship_paths_unrelated(graph):
+    assert graph.all_relationship_paths("9BXKQC1PVLPYFMD6IX", "ORFKQC4KLWEGTGR19L", depth=5) == []
+
+
+def test_all_relationship_paths_partner(graph):
+    paths = graph.all_relationship_paths("cc8205d87831c772e87", "cc8205d872f532ab14e")
+    assert paths == [
+        [
+            {"handle": "cc8205d87831c772e87", "relationship_string": ""},
+            {"handle": "cc8205d872f532ab14e", "relationship_string": "husband"},
+        ]
+    ]
+
+
 def test_reused_connection_across_calls(graph):
     """The same RelationshipGraph/connection answering multiple queries in
     a row is exactly the case that broke before ensure_child_of() was made

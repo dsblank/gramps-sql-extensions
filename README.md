@@ -52,21 +52,77 @@ def execute(sql: str, params: list) -> list[tuple]:
 graph = RelationshipGraph(execute, dialect="sqlite")  # or "postgresql"
 rel_str, dist_a, dist_b = graph.relationship(handle1, handle2)
 all_rels = graph.all_relationships(handle1, handle2)
+path = graph.relationship_path(handle1, handle2)
+all_paths = graph.all_relationship_paths(handle1, handle2)
 ```
 
-`execute` is called many times per call to `relationship()`/
-`all_relationships()`, not once, so it should be a thin, stable wrapper
-around an already-open connection, not something that opens a fresh one
-each time. See `RelationshipGraph.__init__`'s docstring for the full
-contract, including `treeid` (for a multi-tenant Postgres schema; `None`
-for one-tree-per-file SQLite).
+`execute` is called many times per call to any of these, not once, so it
+should be a thin, stable wrapper around an already-open connection, not
+something that opens a fresh one each time. See
+`RelationshipGraph.__init__`'s docstring for the full contract, including
+`treeid` (for a multi-tenant Postgres schema; `None` for one-tree-per-file
+SQLite).
+
+### Drawing a relationship graph (`relationship_path()`)
+
+`relationship_path(h1, h2)` returns the actual chain of people connecting
+`h1` and `h2` through their nearest common ancestor -- the same pairing
+`relationship()` reports, just with every intermediate person included
+rather than collapsed into one string -- as a list of nodes ordered from
+`h1` to `h2`:
+
+```python
+graph.relationship_path(h1, h2)
+# [
+#     {"handle": h1,        "relationship_string": ""},
+#     {"handle": "...",     "relationship_string": "father"},
+#     {"handle": "...",     "relationship_string": "grandfather"},
+#     {"handle": "...",     "relationship_string": "second great grandfather"},
+#     {"handle": "...",     "relationship_string": "third great stepgrandmother"},
+#     {"handle": h2,        "relationship_string": "second great stepgrandaunt"},
+# ]
+```
+
+Each dict is one node (a real person's handle) and consecutive dicts are
+its edges, so this is meant to be walked directly into a graph/chain
+diagram. `relationship_string` is always that node's relationship *to
+`h1`*, not to its neighbor in the chain, so `h1`'s own entry is always
+`""`. Returns `[]` if the two people aren't related within `depth`
+generations, and a single-entry list if `h1 == h2`. Takes the same
+`restricted`/`depth` keywords as `relationship()`.
+
+`all_relationship_paths(h1, h2)` is the same idea, generalized the way
+`all_relationships()` generalizes `relationship()`: two people can share
+more than one common ancestor (cousins who married, or any other
+pedigree collapse), and this returns one path per ancestor, nearest
+first, rather than just the closest one:
+
+```python
+graph.all_relationship_paths(h1, h2)
+# [
+#     [{"handle": h1, "relationship_string": ""}, ..., {"handle": h2, "relationship_string": "second cousin"}],
+#     [{"handle": h1, "relationship_string": ""}, ..., {"handle": h2, "relationship_string": "third cousin once removed"}],
+#     ...
+# ]
+```
+
+`all_relationship_paths(h1, h2)[0]` always equals `relationship_path(h1,
+h2)`. Unlike `all_relationships()`, entries here are grouped by ancestor,
+not by wording -- two different ancestors that happen to produce
+identical wording still come back as two separate paths, since the point
+is showing the actual distinct routes, not counting how many ways there
+are to say it. Pedigree collapse can in principle surface a common
+ancestor for every generation two people's lines cross, so pass
+`max_paths=N` to cap how many are returned (`None`, the default, returns
+all of them).
 
 ### Public-only search (`restricted=True`)
 
-Both `relationship()` and `all_relationships()` take a `restricted`
-keyword, `False` by default. Pass `restricted=True` when the caller
-shouldn't see anyone's private data, e.g. an anonymous or logged-out
-visitor to a public family tree site. It mirrors `PrivateProxyDb`'s three
+`relationship()`, `all_relationships()`, `relationship_path()`, and
+`all_relationship_paths()` all take a `restricted` keyword, `False` by
+default. Pass `restricted=True` when the caller shouldn't see anyone's
+private data, e.g. an anonymous or logged-out visitor to a public family
+tree site. It mirrors `PrivateProxyDb`'s three
 rules exactly: a private person, a private family, or a private
 `ChildRef` all make that link invisible, as if it didn't exist in the
 graph at all — not merely redacted after the fact.
