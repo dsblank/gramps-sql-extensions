@@ -615,9 +615,12 @@ class RelationshipGraph:
     def _relationship_to(self, h1: str, other: str, restricted: bool, depth: int, dist1, path1, pm1) -> str:
         """Relationship of `other` to `h1`, reusing `h1`'s already-built
         ancestor map (`dist1`/`path1`/`pm1`) rather than recomputing it --
-        the piece of `relationship()` that's expensive per call and, for
-        `relationship_path()` below, is the same for every node along the
-        chain. Only `other`'s own map is fetched fresh each call."""
+        the piece of `relationship()` that's expensive per call. Only
+        `other`'s own map is fetched fresh each call, since -- unlike
+        `relationship_path`/`all_relationship_paths`, where every node is
+        already known to sit on a specific, already-computed chain --
+        `relationships_to` calls this for arbitrary target handles with
+        no such shortcut available."""
         spouse = self.check_spouse(h1, other, restricted)
         if spouse is not None:
             spouse_type, gender1, gender2 = spouse
@@ -716,13 +719,14 @@ class RelationshipGraph:
             return []
 
         anc = self._best_common_ancestor(dist1, path1, dist2, path2, common)
+        chain1, chain2 = self._chain_pair(prev1, prev2, anc)  # [h1,...,anc], [h2,...,anc]
 
-        chain1 = self._chain_to_ancestor(prev1, anc)  # [h1, ..., anc]
-        chain2 = self._chain_to_ancestor(prev2, anc)  # [h2, ..., anc]
-        nodes = chain1 + list(reversed(chain2[:-1]))  # h1 .. anc .. h2
-
-        for node in nodes[1:]:
-            rel_str = self._relationship_to(h1, node, restricted, depth, dist1, path1, pm1)
+        gender1 = self.gender(h1)
+        for node in chain1[1:]:
+            rel_str = self._label_direct_ancestor(h1, node, dist1, path1, gender1)
+            result.append({"handle": node, "relationship_string": rel_str})
+        for node in reversed(chain2[:-1]):
+            rel_str = self._label_via_ancestor(h1, node, anc, dist1, path1, pm1, dist2, path2, pm2, gender1)
             result.append({"handle": node, "relationship_string": rel_str})
 
         return result
