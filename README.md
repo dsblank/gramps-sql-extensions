@@ -185,6 +185,43 @@ This is what a Gramps Web-style deployment should use for any relationship
 lookup made on behalf of a non-owner viewer; use `restricted=False` only
 for callers already authorized to see private data.
 
+### Performance
+
+Measured against a real 101,518-person / 46,315-family SQLite tree
+(warm OS page cache; a remote Postgres deployment adds real network
+round-trip latency on top of every number below):
+
+- A single `relationship()`, `relationship_path()`, or
+  `all_relationship_paths()` call: ~600-630ms, almost entirely spent in
+  `ensure_child_of()` rebuilding its temp table from every family in the
+  tree. The actual search on top of that -- the 1-2 `ancestor_map`
+  calls, walking the chain, wording each node -- adds only a few
+  milliseconds, regardless of whether the pair turns out related.
+- `relationships_to()` amortizes that same rebuild across every target
+  in one call instead of paying it per pair: ~9s for all 101,518 people
+  from one root handle (~0.09ms/target after the shared setup cost), vs.
+  the ~630ms *each* that many separate `relationship()` calls would cost.
+- `relationship_path()` used to also redo a full `ancestor_map` +
+  `check_spouse` query for every intermediate person in its chain; this
+  was fixed to reuse `h1`'s and `h2`'s already-computed ancestor maps
+  instead (the same approach `all_relationship_paths()` always used), so
+  now every method pays that per-call setup cost exactly once.
+
+`ensure_child_of()`'s temp table is always dropped and rebuilt on every
+top-level call, deliberately never cached across calls -- `restricted`
+doesn't affect its contents (privacy filtering happens later, in
+`ancestor_map()`/`check_spouse()`'s own queries against it), but
+`RelationshipGraph` never sees the actual database connection, only the
+caller's opaque `execute` callable, so it has no reliable way to know
+whether that connection is exclusive to this instance for the duration
+of a call or handed back to a pool afterward. Skipping the rebuild on a
+pooled or multi-tenant (e.g. SharedPostgreSQL) connection risks silently
+serving one tree's -- or one user's -- data as part of another's answer.
+Always rebuilding is the one behavior that's correct regardless of the
+caller's connection model, so that's the tradeoff made here: safety by
+construction over shaving a rebuild that's already the dominant cost of
+any single call.
+
 ## License
 
 GPL-2.0-or-later, matching Gramps.
