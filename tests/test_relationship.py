@@ -226,6 +226,63 @@ def test_relationships_to_page_zero_returns_everything(graph):
     assert len(result["items"]) == result["total"] == 2
 
 
+def test_ancestor_map_returns_dict_with_expected_keys(graph):
+    """ancestor_map() returns a dict, not a positional tuple, precisely so
+    a future added key (e.g. gender, family_handle) can't silently break
+    a caller unpacking it -- lock down the current key set."""
+    h1 = "9BXKQC1PVLPYFMD6IX"
+    graph.ensure_child_of()
+    m = graph.ancestor_map(h1, restricted=False)
+    assert isinstance(m, dict)
+    assert set(m.keys()) == {"dist", "path", "prev", "parent_of"}
+
+
+def test_ancestor_map_root_entry(graph):
+    h1 = "9BXKQC1PVLPYFMD6IX"
+    graph.ensure_child_of()
+    m = graph.ancestor_map(h1, restricted=False)
+    assert m["dist"][h1] == 0
+    assert m["path"][h1] == ""
+    assert m["prev"][h1] is None
+
+
+def test_ancestor_map_direct_parent(graph):
+    """The known father from the relationship_path() chain tests: one
+    generation up, path code 'f' (birth father), discovered from h1."""
+    h1 = "9BXKQC1PVLPYFMD6IX"
+    father = "HKTJQCIJD8RK9RJFO1"
+    graph.ensure_child_of()
+    m = graph.ancestor_map(h1, restricted=False)
+    assert m["dist"][father] == 1
+    assert m["path"][father] == "f"
+    assert m["prev"][father] == h1
+    assert (father, "f", 1) in m["parent_of"][h1]
+
+
+def test_ancestor_map_depth_boundary(graph):
+    """Matches relationship()'s own depth semantics: max_depth=1 finds
+    only the root itself (dist=0), max_depth=2 also finds its direct
+    parents (dist=1) but no further."""
+    h1 = "9BXKQC1PVLPYFMD6IX"
+    graph.ensure_child_of()
+    m1 = graph.ancestor_map(h1, restricted=False, max_depth=1)
+    assert set(m1["dist"].values()) == {0}
+    m2 = graph.ancestor_map(h1, restricted=False, max_depth=2)
+    assert set(m2["dist"].values()) == {0, 1}
+
+
+def test_ancestor_map_respects_privacy(privacy_graph):
+    graph, h = privacy_graph
+    graph.ensure_child_of()
+    m_open = graph.ancestor_map(h["child1"], restricted=False)
+    m_restricted = graph.ancestor_map(h["child1"], restricted=True)
+    assert h["mother1"] in m_open["dist"]
+    assert h["mother1"] not in m_restricted["dist"]
+    # the other, non-private parent stays visible either way
+    assert h["father1"] in m_open["dist"]
+    assert h["father1"] in m_restricted["dist"]
+
+
 def test_reused_connection_across_calls(graph):
     """The same RelationshipGraph/connection answering multiple queries in
     a row is exactly the case that broke before ensure_child_of() was made
