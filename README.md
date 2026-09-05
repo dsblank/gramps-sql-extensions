@@ -54,6 +54,7 @@ rel_str, dist_a, dist_b = graph.relationship(handle1, handle2)
 all_rels = graph.all_relationships(handle1, handle2)
 path = graph.relationship_path(handle1, handle2)
 all_paths = graph.all_relationship_paths(handle1, handle2)
+paged = graph.relationships_to(handle1, handles=[handle2, handle3])
 ```
 
 `execute` is called many times per call to any of these, not once, so it
@@ -116,11 +117,51 @@ ancestor for every generation two people's lines cross, so pass
 `max_paths=N` to cap how many are returned (`None`, the default, returns
 all of them).
 
+### Bulk lookup, paged like gramps-web-api (`relationships_to()`)
+
+`relationships_to(h1, handles=...)` returns `h1`'s relationship to each
+of a list of people in one call, paged the same way gramps-web-api's own
+object-list resources are: `page` (1-indexed, default `0` meaning "no
+paging, return everything") and `pagesize` (default `20`) match that
+project's field names, defaults, and semantics exactly, so a caller
+already wired up for gramps-web-api-style paging doesn't need a second
+convention here.
+
+```python
+graph.relationships_to(h1, handles=[h2, h3, "does-not-exist"])
+# {
+#     "items": [
+#         {"handle": h2, "relationship_string": "second cousin"},
+#         {"handle": h3, "relationship_string": ""},  # not related within `depth`
+#     ],
+#     "total": 2,   # "does-not-exist" was silently dropped, same as
+#                   # gramps-web-api's own `handles` query param
+#     "page": 0,
+#     "pagesize": 20,
+# }
+```
+
+`handles=None` means every person in the tree, ordered by handle,
+standing in for "list all objects" the way omitting gramps-web-api's own
+`handles` param does. `total` reflects the visible target count *before*
+paging, so a caller can compute how many pages there are. A handle that
+doesn't exist, or (with `restricted=True`) belongs to a private person,
+is silently skipped -- from an explicit `handles` list, and from the
+`handles=None` "everyone" listing -- since there's no already-proxied
+`db_handle` here to have hidden it upstream.
+
+Note that the default `page=0` computes a relationship for every visible
+person in the tree when `handles=None` -- correct, and consistent with
+gramps-web-api's own "if omitted, all results are returned" contract,
+but genuinely expensive on a large tree (one small query per person, see
+`ancestor_map`). Pass an actual `page` to avoid that.
+
 ### Public-only search (`restricted=True`)
 
-`relationship()`, `all_relationships()`, `relationship_path()`, and
-`all_relationship_paths()` all take a `restricted` keyword, `False` by
-default. Pass `restricted=True` when the caller shouldn't see anyone's
+`relationship()`, `all_relationships()`, `relationship_path()`,
+`all_relationship_paths()`, and `relationships_to()` all take a
+`restricted` keyword, `False` by default. Pass `restricted=True` when
+the caller shouldn't see anyone's
 private data, e.g. an anonymous or logged-out visitor to a public family
 tree site. It mirrors `PrivateProxyDb`'s three
 rules exactly: a private person, a private family, or a private

@@ -63,3 +63,32 @@ def test_all_relationship_paths_respects_privacy(privacy_graph):
     unrestricted = graph.all_relationship_paths(h["child1"], h["mother1"], restricted=False)
     assert len(unrestricted) == 1
     assert unrestricted[0][-1]["relationship_string"] == "mother"
+
+
+def test_relationships_to_hides_private_target_person(privacy_graph):
+    """mother1 is herself a private Person (not just a private link), so
+    a restricted caller shouldn't see her as a target at all -- silently
+    dropped from an explicit `handles` list, and absent from the
+    `handles=None` "everyone" listing, same as PrivateProxyDb hiding a
+    private Person object entirely from a listing endpoint."""
+    graph, h = privacy_graph
+
+    explicit = graph.relationships_to(
+        h["child1"], handles=[h["father1"], h["mother1"]], restricted=True
+    )
+    assert [item["handle"] for item in explicit["items"]] == [h["father1"]]
+    assert explicit["total"] == 1
+
+    unrestricted_explicit = graph.relationships_to(
+        h["child1"], handles=[h["father1"], h["mother1"]], restricted=False
+    )
+    assert {item["handle"] for item in unrestricted_explicit["items"]} == {
+        h["father1"],
+        h["mother1"],
+    }
+
+    everyone_restricted = graph.relationships_to(h["child1"], restricted=True)
+    everyone_unrestricted = graph.relationships_to(h["child1"], restricted=False)
+    assert h["mother1"] not in {item["handle"] for item in everyone_restricted["items"]}
+    assert h["mother1"] in {item["handle"] for item in everyone_unrestricted["items"]}
+    assert everyone_restricted["total"] < everyone_unrestricted["total"]

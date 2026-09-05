@@ -175,6 +175,57 @@ def test_all_relationship_paths_partner(graph):
     ]
 
 
+def test_relationships_to_explicit_handles(graph):
+    h1, h2 = "9BXKQC1PVLPYFMD6IX", "ORFKQC4KLWEGTGR19L"
+    result = graph.relationships_to(h1, handles=[h1, h2, "does-not-exist"])
+    # the nonexistent handle is silently skipped, matching gramps-web-api's
+    # own "non-existing handles are silently skipped" `handles` param
+    assert result == {
+        "items": [
+            {"handle": h1, "relationship_string": ""},
+            {"handle": h2, "relationship_string": "second great stepgrandaunt"},
+        ],
+        "total": 2,
+        "page": 0,
+        "pagesize": 20,
+    }
+
+
+def test_relationships_to_unrelated_is_empty_string(graph):
+    h1 = "9BXKQC1PVLPYFMD6IX"
+    result = graph.relationships_to(h1, handles=[h1, "004KQCGYT27EEPQHK"])
+    assert result["items"][1]["relationship_string"] == ""
+    # "" here means "not related within depth", same as relationship()'s
+    # own return for this exact pair
+    assert graph.relationship(h1, "004KQCGYT27EEPQHK")[0] == ""
+
+
+def test_relationships_to_all_people_is_paged(graph):
+    h1 = "9BXKQC1PVLPYFMD6IX"
+    page1 = graph.relationships_to(h1, page=1, pagesize=5)
+    page2 = graph.relationships_to(h1, page=2, pagesize=5)
+    assert page1["page"] == 1 and page1["pagesize"] == 5
+    assert len(page1["items"]) == 5
+    assert len(page2["items"]) == 5
+    assert page1["items"] != page2["items"]
+    # total reflects every person in the tree, not just this page
+    assert page1["total"] == page2["total"] > 100
+    # handles=None with page=0 (the default) means "everything", matching
+    # gramps-web-api's own page=0 contract -- verify by grabbing everyone
+    # via a large page and comparing against relationship() directly
+    everyone = graph.relationships_to(h1, page=1, pagesize=page1["total"])["items"]
+    sample = everyone[10]
+    if sample["handle"] != h1:
+        assert graph.relationship(h1, sample["handle"])[0] == sample["relationship_string"]
+
+
+def test_relationships_to_page_zero_returns_everything(graph):
+    h1, h2 = "9BXKQC1PVLPYFMD6IX", "ORFKQC4KLWEGTGR19L"
+    result = graph.relationships_to(h1, handles=[h1, h2])
+    assert result["page"] == 0
+    assert len(result["items"]) == result["total"] == 2
+
+
 def test_reused_connection_across_calls(graph):
     """The same RelationshipGraph/connection answering multiple queries in
     a row is exactly the case that broke before ensure_child_of() was made

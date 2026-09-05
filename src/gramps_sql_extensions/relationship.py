@@ -809,3 +809,103 @@ class RelationshipGraph:
             paths.append(path)
 
         return paths
+
+    # -- bulk lookup, paged like gramps-web-api's own object-list resources -
+
+    def _all_person_handles(self, restricted: bool) -> list[str]:
+        """Every person handle in this tree, ordered by handle for a
+        stable paging order across calls. A private person is excluded
+        entirely for a restricted viewer -- not just their links -- since
+        this feeds `relationships_to`'s "list everyone" mode, the
+        equivalent of a person-listing endpoint, not a link traversal."""
+        t = _tree_clause("person", self._treeid)
+        where = f"WHERE 1=1 {t}"
+        if restricted:
+            where += " AND COALESCE(private, 0) = 0"
+        rows = self._execute(f"SELECT handle FROM person {where} ORDER BY handle", [])
+        return [row[0] for row in rows]
+
+    def _visible_handles(self, handles: list[str], restricted: bool) -> set:
+        """The subset of `handles` that both exist and, if `restricted`,
+        aren't privacy-hidden -- mirrors gramps-web-api's own `handles`
+        query param ("non-existing handles are silently skipped"),
+        extended here to also silently skip private people for a
+        restricted caller, same as `_all_person_handles`."""
+        if not handles:
+            return set()
+        t = _tree_clause("person", self._treeid)
+        placeholders = ",".join("?" for _ in handles)
+        where_private = "AND COALESCE(private, 0) = 0" if restricted else ""
+        rows = self._execute(
+            f"SELECT handle FROM person WHERE handle IN ({placeholders}) {t} {where_private}",
+            list(handles),
+        )
+        return {row[0] for row in rows}
+
+    def relationships_to(
+        self,
+        h1: str,
+        handles: Optional[list[str]] = None,
+        restricted: bool = False,
+        depth: int = 15,
+        page: int = 0,
+        pagesize: int = 20,
+    ):
+        """Return the relationship string of `h1` to each of `handles`,
+        paged the same way gramps-web-api's own object-list resources
+        are (`page`/`pagesize`, both matching that project's field
+        defaults exactly): `page` is 1-indexed, and the default `page=0`
+        means "no paging, return everything" rather than "page zero".
+        `handles=None` means every person in the tree, ordered by
+        handle, standing in for "list all objects" -- there's no
+        object-list endpoint to delegate that to here, so it's built
+        from a plain `SELECT handle FROM person` instead.
+
+        A handle that doesn't exist, or (when `restricted=True`) belongs
+        to a private person, is silently skipped -- from `handles`
+        itself, and from the "everyone" listing when `handles is None`
+        -- mirroring gramps-web-api's own "non-existing handles are
+        silently skipped" `handles` param, extended to privacy since
+        there's no proxied `db_handle` here to have already done that.
+
+        Returns `{"items": [...], "total": N, "page": page, "pagesize":
+        pagesize}`. `items` is a list of `{"handle", "relationship_string"}`
+        dicts for the requested page (or everything, if `page=0`);
+        `total` is the count of visible target handles *before* paging,
+        letting a caller compute how many pages there are. `h1`'s own
+        entry (if it appears in `handles`, or always when `handles is
+        None`) gets `relationship_string=""`, same self-convention as
+        `relationship_path()`.
+
+        Note that `page=0` computes a relationship for every visible
+        person in the tree, one small query per person (see
+        `ancestor_map`) -- correct, and consistent with gramps-web-api's
+        own "if omitted, all results are returned" contract for object
+        listings, but genuinely expensive on a large tree. Pass an
+        actual `page` to avoid that.
+        """
+        self.ensure_child_of()
+
+        if handles is None:
+            target_handles = self._all_person_handles(restricted)
+        else:
+            visible = self._visible_handles(handles, restricted)
+            target_handles = [h for h in handles if h in visible]
+
+        total = len(target_handles)
+        if page > 0:
+            offset = (page - 1) * pagesize
+            target_handles = target_handles[offset : offset + pagesize]
+
+        m1 = self.ancestor_map(h1, restricted, max_depth=depth)
+        dist1, path1, pm1 = m1["dist"], m1["path"], m1["parent_of"]
+
+        items = []
+        for other in target_handles:
+            if other == h1:
+                rel_str = ""
+            else:
+                rel_str = self._relationship_to(h1, other, restricted, depth, dist1, path1, pm1)
+            items.append({"handle": other, "relationship_string": rel_str})
+
+        return {"items": items, "total": total, "page": page, "pagesize": pagesize}
