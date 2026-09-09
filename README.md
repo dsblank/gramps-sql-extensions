@@ -4,7 +4,11 @@ A collection of SQL-accelerated implementations of operations Gramps
 normally performs by walking Python objects. Each module targets one such
 operation. So far:
 
-- **Relationship lookup** (`gramps_sql_extensions.relationship`)
+- **Relationship lookup** (`gramps_sql_extensions.relationship`) --
+  `relationship()`/`all_relationships()` for the wording between two
+  people, `relationship_path()`/`all_relationship_paths()` for the actual
+  chain of intermediate people, and `relationships_to()` for bulk,
+  gramps-web-api-compatible paged lookups against a whole list of people.
 
 ## Relationship lookup
 
