@@ -50,13 +50,25 @@ connection object. The caller supplies a single `execute` callable --
 See `RelationshipGraph.__init__` for the exact contract that callable
 needs to satisfy.
 
-CURRENT STATE: `child_of` is built as a session-scoped SQL temp table on
-each call to `ensure_child_of`, extracted fresh from `family.json_data`
-every time. That avoids all Person/Family object construction and is
-measured at roughly 100ms (SQLite, ~7k people) to 1-1.5s (Postgres, ~100k
-people) -- dramatically cheaper than deserializing the whole tree, and it
-needs no schema changes to use. The further upgrade validated separately
-(not implemented here) is promoting `child_of` to a real, permanent table
+CURRENT STATE: `ensure_child_of` loads every parent/child edge into this
+`RelationshipGraph` instance's own Python memory on each call, via one
+plain `SELECT` against `family.json_data` (no DDL of any kind -- no temp
+table, no index, nothing written to the database at all, so this works
+against a genuinely read-only connection, not just an application-level
+"read-only" convention). `ancestor_map` and `_family_partner` then walk
+that in-memory edge index directly instead of issuing further SQL. That
+avoids all Person/Family object construction and, on the same real
+101,518-person / 46,315-family Postgres tree used for the numbers in the
+README, measures faster end-to-end than an earlier version of this module
+that built a session-scoped SQL temp table (with an index on it) for the
+same purpose -- both for a single lookup and, especially, for
+`relationships_to`'s bulk case, where the whole edge index is loaded once
+and then every target is answered from memory with no further queries at
+all. The tradeoff: `ensure_child_of` now pulls the *entire* tree's edges
+across the connection on every call, rather than a temp table's much
+smaller per-query result sets -- on a real (non-loopback) network link,
+that transfer cost matters more than it did here. The further upgrade
+validated separately (not implemented here) is a real, permanent table
 maintained incrementally by `AFTER INSERT/UPDATE/DELETE` triggers on
 `family` (and `person`, for the privacy-flip case) -- tested end-to-end in
 SQLite and roughly 1000x faster again once indexed, but that's a
@@ -96,11 +108,11 @@ _NORM_SIB, _HALF_SIB_FATHER, _HALF_SIB_MOTHER, _STEP_SIB, _UNKNOWN_SIB = range(5
 # with `?` too, since translating that is the caller's adapter's job, not
 # this module's) and a list of positional parameters, run it and return
 # every row as a list of tuples. Called many times per logical operation
-# (ancestor_map alone issues one query; check_spouse issues one per family
-# in a person's family_list), so it should be a thin, stable wrapper over
-# an already-open connection, not something that opens a fresh one per call.
-# For DDL statements (CREATE/DROP/CREATE INDEX) the return value is ignored,
-# so returning an empty list is fine.
+# (check_spouse issues one query per family in a person's family_list), so
+# it should be a thin, stable wrapper over an already-open connection, not
+# something that opens a fresh one per call. Every statement this module
+# issues is a plain SELECT -- no DDL, nothing written to the connection at
+# all -- so a read-only connection/role works here with no special casing.
 ExecuteFn = Callable[[str, list], list[tuple]]
 
 
@@ -198,6 +210,23 @@ class RelationshipGraph:
     Gramps `Connection` wrapper, anything with that one shape works. See
     `ExecuteFn` above for the full contract.
 
+    No DDL, ever: `ensure_child_of()` (called by every public method here)
+    loads every parent/child edge into this instance's own Python memory
+    via a single plain `SELECT`, then `ancestor_map()`/`_family_partner()`
+    walk that in-memory index -- no `CREATE`/`DROP`/`INDEX` statement is
+    ever sent through `execute`. That makes this class safe to use against
+    a connection that's genuinely read-only at the database/role level
+    (e.g. a Postgres role granted only `SELECT`, a read replica), not just
+    one where "read-only" is an unenforced application-level convention
+    (as with Gramps' own `DbGeneric.load(..., readonly=True)`, which
+    gramps-core itself documents as *not enforced by Gramps* -- enforcement
+    is left to the caller). The tradeoff for that: `ensure_child_of()`
+    pulls the *entire* tree's parent/child edges across the connection on
+    every call (not just the smaller result set a targeted query would
+    return), so on a real (non-loopback) network link to the database,
+    that transfer cost is the one to watch, especially on a very large
+    tree.
+
     `dialect` is `"sqlite"`, `"postgresql"`, or `"sharedpostgresql"`.
     `treeid` is the backend's own integer tree-scoping column value (only
     meaningful for a multi-tenant Postgres schema; `None` for SQLite,
@@ -210,6 +239,12 @@ class RelationshipGraph:
         self._execute_fn = execute
         self._dialect = _dialect_for(dialect)
         self._treeid = treeid
+        # Populated by ensure_child_of(); None until then so a caller that
+        # skips it gets a clear error rather than a confusing KeyError deep
+        # inside ancestor_map()/_family_partner().
+        self._edges_all: Optional[dict[str, list[tuple[str, str, int]]]] = None
+        self._edges_safe: Optional[dict[str, list[tuple[str, str, int]]]] = None
+        self._family_partner_map: Optional[dict[tuple[str, str], str]] = None
         self._calc = get_relationship_calculator(reinit=True, clocale=locale)
         # get_relationship_calculator() picks the right calculator *class*
         # for the locale (e.g. rel_it.py's subclass), but string translation
@@ -246,56 +281,34 @@ class RelationshipGraph:
         keeps working if a later version adds a new key (e.g. gender,
         family_handle) -- unlike positional unpacking, which breaks the
         moment the shape grows."""
-        d = self._dialect
-        t_pp = _tree_clause("pp", self._treeid)
-        t_ff = _tree_clause("ff", self._treeid)
+        if self._edges_all is None:
+            raise RuntimeError("ensure_child_of() must be called before ancestor_map()")
+        edges = self._edges_safe if restricted else self._edges_all
 
-        privacy_join = privacy_where = ""
-        if restricted:
-            privacy_join = (
-                f"JOIN person pp ON pp.handle = co.parent {t_pp}\n"
-                f"        JOIN family ff ON ff.handle = co.family_handle {t_ff}"
-            )
-            privacy_where = (
-                "AND co.childref_private = 0\n"
-                "          AND COALESCE(pp.private, 0) = 0\n"
-                "          AND COALESCE(ff.private, 0) = 0"
-            )
+        # Unbounded reachability closure from `handle`, entirely in Python
+        # over the in-memory edge index -- mirrors what the old SQL
+        # recursive CTE computed here (that had no depth limit either;
+        # only the generation-distance walk below is bounded by
+        # max_depth). Kept as a separate pass so `parent_of` ends up with
+        # every edge for every reachable ancestor, even one beyond
+        # max_depth generations, matching the old query's "child is in
+        # `anc`" semantics exactly -- sibling_type()/_typed_parents() need
+        # every edge *type* for a child, not just the one edge the BFS
+        # below happens to use to reach it first.
+        anc = {handle}
+        frontier = [handle]
+        while frontier:
+            nxt = []
+            for h in frontier:
+                for parent, _code, _rel in edges.get(h, ()):
+                    if parent not in anc:
+                        anc.add(parent)
+                        nxt.append(parent)
+            frontier = nxt
 
-        # `child_of` here is a session temp table (see ensure_child_of),
-        # not yet the permanent trigger-maintained table described in the
-        # module docstring. It has no `treeid` column of its own:
-        # ensure_child_of already scopes it to the current tree at build
-        # time via a tree clause against the source `family` table, so
-        # every row in it already belongs to this tree.
-        #
-        # The privacy predicate is applied BOTH inside the recursive term
-        # (so a private link is never traversed) AND again on the final
-        # edge SELECT: "child is in the privacy-safe `anc` set" only proves
-        # that handle is *reachable* via a safe path, not that every one of
-        # its own edges is safe to hand back -- omitting the second filter
-        # lets an unrelated private edge leak into the Python-side BFS.
-        query = f"""
-        WITH RECURSIVE anc(handle) AS (
-            SELECT ?{d.param_cast}
-            UNION
-            SELECT co.parent
-            FROM anc
-            JOIN child_of co ON co.child = anc.handle
-            {privacy_join}
-            WHERE 1=1 {privacy_where}
-        )
-        SELECT co.parent, co.child, co.code, co.relvalue
-        FROM child_of co
-        {privacy_join}
-        WHERE co.child IN (SELECT handle FROM anc)
-        {privacy_where}
-        """
-        edges = self._execute(query, (handle,))
-
-        parent_of: dict[str, list[tuple[str, str, int]]] = {}
-        for parent, child, code, relvalue in edges:
-            parent_of.setdefault(child, []).append((parent, code, relvalue))
+        parent_of: dict[str, list[tuple[str, str, int]]] = {
+            child: edges[child] for child in anc if child in edges
+        }
 
         # gramps-core's own depth cutoff (RelationshipCalculator.__apply_filter)
         # excludes a generation once its internal counter (which starts at 1
@@ -323,23 +336,23 @@ class RelationshipGraph:
         return {"dist": dist, "path": path, "prev": prev, "parent_of": parent_of}
 
     def ensure_child_of(self) -> None:
-        """(Re)build the session temp table `ancestor_map` reads from. Call
-        once per logical operation (relationship()/all_relationships()
-        already do this) before the first `ancestor_map`/`check_spouse`
-        call. Always drops and rebuilds rather than reusing an existing
-        temp table: if the underlying DB connection is reused across
-        multiple calls (common when `execute` wraps a pooled or long-lived
-        connection), a temp table left over from an earlier call would
-        otherwise either collide (`CREATE TEMP TABLE` without `IF NOT
-        EXISTS` fails outright) or, worse, silently serve data that's gone
-        stale since. See the module docstring for the trigger-maintained-
-        table upgrade that would remove this per-call rebuild cost."""
+        """(Re)load this instance's in-memory parent/child edge index --
+        `ancestor_map()`/`_family_partner()` read it directly, no further
+        SQL involved. Call once per logical operation
+        (relationship()/all_relationships() already do this) before the
+        first `ancestor_map()`/`check_spouse()` call. Always reloads
+        rather than trusting a previous load: if this `RelationshipGraph`
+        instance is reused across multiple logical operations (common when
+        it wraps a pooled or long-lived connection, e.g. one instance per
+        web app process rather than per request), skipping the reload
+        would risk answering with edges that have gone stale since a tree
+        edit between calls. See the module docstring for the trigger-
+        maintained-table upgrade that would remove this per-call reload
+        cost -- and for why this reload is one plain `SELECT`, no DDL."""
         d = self._dialect
-        t = _tree_clause("f", self._treeid)
-        self._execute("DROP TABLE IF EXISTS child_of", [])
-        self._execute(
+        t_family = _tree_clause("f", self._treeid)
+        rows = self._execute(
             f"""
-            CREATE TEMP TABLE child_of AS
             SELECT f.handle AS family_handle, f.father_handle AS parent,
                    {d.ref_expr} AS child,
                    CASE WHEN {d.frel_expr} = 1 THEN 'f' ELSE 'F' END AS code,
@@ -347,7 +360,7 @@ class RelationshipGraph:
                    {d.childref_private_expr} AS childref_private
             FROM family f
             {d.child_ref_from}
-            WHERE f.father_handle IS NOT NULL {t}
+            WHERE f.father_handle IS NOT NULL {t_family}
             UNION ALL
             SELECT f.handle, f.mother_handle,
                    {d.ref_expr},
@@ -356,11 +369,61 @@ class RelationshipGraph:
                    {d.childref_private_expr}
             FROM family f
             {d.child_ref_from}
-            WHERE f.mother_handle IS NOT NULL {t}
+            WHERE f.mother_handle IS NOT NULL {t_family}
             """,
             [],
         )
-        self._execute("CREATE INDEX idx_child_of_child ON child_of(child)", [])
+
+        # Privacy inputs for edges_safe below, mirroring PrivateProxyDb's
+        # three rules exactly (childref_private is already per-edge, from
+        # the query above): which persons and which families are private,
+        # tree-scoped the same way the edge query itself is.
+        t_person = _tree_clause("person", self._treeid)
+        private_persons = {
+            row[0]
+            for row in self._execute(
+                f"SELECT handle FROM person WHERE 1=1 {t_person} AND COALESCE(private, 0) != 0", []
+            )
+        }
+        private_families = {
+            row[0]
+            for row in self._execute(
+                f"SELECT handle FROM family f WHERE 1=1 {t_family} AND COALESCE(f.private, 0) != 0", []
+            )
+        }
+
+        edges_all: dict[str, list[tuple[str, str, int]]] = {}
+        edges_safe: dict[str, list[tuple[str, str, int]]] = {}
+        # (family_handle, child) -> parents in that family producing that
+        # child -- almost always at most 2 (father, mother), grouped here
+        # so _family_partner() below can look up "the other one" in O(1)
+        # instead of re-scanning every call.
+        family_children: dict[tuple[str, str], list[str]] = {}
+
+        for family_handle, parent, child, code, relvalue, childref_private in rows:
+            edges_all.setdefault(child, []).append((parent, code, relvalue))
+            safe = not childref_private and parent not in private_persons and family_handle not in private_families
+            if safe:
+                edges_safe.setdefault(child, []).append((parent, code, relvalue))
+            family_children.setdefault((family_handle, child), []).append(parent)
+
+        # No privacy filtering here, deliberately -- see _family_partner()'s
+        # own docstring: this is only ever used as an unconfirmed candidate,
+        # checked against the caller's own (already privacy-aware) common-
+        # ancestor set before being treated as anything more than that.
+        partner_map: dict[tuple[str, str], str] = {}
+        for (_family_handle, child), parents in family_children.items():
+            if len(parents) < 2:
+                continue
+            for i, p in enumerate(parents):
+                for q in parents[i + 1 :]:
+                    if q != p:
+                        partner_map.setdefault((child, p), q)
+                        partner_map.setdefault((child, q), p)
+
+        self._edges_all = edges_all
+        self._edges_safe = edges_safe
+        self._family_partner_map = partner_map
 
     # -- spouse / sibling -------------------------------------------------
 
@@ -555,17 +618,7 @@ class RelationshipGraph:
         pairing, before treating it as anything more than a hypothesis,
         so this needs no privacy filtering of its own -- an unsafe
         candidate simply won't pass that later check."""
-        rows = self._execute(
-            """
-            SELECT co2.parent
-            FROM child_of co1
-            JOIN child_of co2
-              ON co2.family_handle = co1.family_handle AND co2.child = co1.child
-            WHERE co1.child = ? AND co1.parent = ? AND co2.parent != co1.parent
-            """,
-            (child, anc),
-        )
-        return rows[0][0] if rows else None
+        return self._family_partner_map.get((child, anc))
 
     @staticmethod
     def _famrel_from_persrel(persrel_a: str, persrel_b: str) -> str:

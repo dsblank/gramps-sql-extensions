@@ -48,10 +48,7 @@ from gramps_sql_extensions import RelationshipGraph
 def execute(sql: str, params: list) -> list[tuple]:
     cursor = my_connection.cursor()
     cursor.execute(sql, params)
-    try:
-        return cursor.fetchall()
-    except Exception:
-        return []  # DDL statements (CREATE/DROP/CREATE INDEX) have no rows
+    return cursor.fetchall()
 
 graph = RelationshipGraph(execute, dialect="sqlite")  # or "postgresql"
 rel_str, dist_a, dist_b = graph.relationship(handle1, handle2)
@@ -67,6 +64,22 @@ something that opens a fresh one each time. See
 `RelationshipGraph.__init__`'s docstring for the full contract, including
 `treeid` (for a multi-tenant Postgres schema; `None` for one-tree-per-file
 SQLite).
+
+**This library issues no DDL at all -- every statement is a plain
+`SELECT`.** `ensure_child_of()` (called by every top-level method) loads
+the tree's parent/child edges into the `RelationshipGraph` instance's own
+Python memory, once per call, and everything downstream
+(`ancestor_map()`, sibling/family-collapsing) walks that in-memory index
+instead of issuing further SQL. That makes this safe to use against a
+connection that's genuinely read-only at the database/role level (a
+Postgres role granted only `SELECT`, a read replica) -- not just one
+where "read-only" is an unenforced convention, as with Gramps' own
+`DbGeneric.load(..., readonly=True)` (documented by gramps-core itself as
+*not enforced by Gramps*, enforcement left to the caller). The tradeoff:
+`ensure_child_of()` pulls the tree's *entire* edge set across the
+connection every call, not just a targeted result set, so on a real
+(non-loopback) network link to the database that transfer cost is the
+one to watch on a very large tree.
 
 ### Drawing a relationship graph (`relationship_path()`)
 
@@ -191,18 +204,24 @@ for callers already authorized to see private data.
 
 ### Performance
 
-Measured against a real 101,518-person / 46,315-family SQLite tree
-(warm OS page cache; a remote Postgres deployment adds real network
-round-trip latency on top of every number below):
+Measured against a real 101,518-person / 46,315-family tree, both SQLite
+and Postgres (treeid-scoped, sharing that same data). The SQLite numbers
+below are from an earlier version of this module, before the rewrite
+described just above that dropped the session-scoped SQL temp table in
+favor of loading edges straight into Python; they haven't been re-run
+against the current DDL-free code (expected to be at least as fast, since
+that rewrite only removed work, but not yet verified at this scale on
+SQLite specifically -- rebuilding a tree this size takes 20+ hours, so
+this note will be updated rather than re-measured from scratch):
 
 - A single `relationship()`, `relationship_path()`, or
-  `all_relationship_paths()` call: ~600-630ms, almost entirely spent in
-  `ensure_child_of()` rebuilding its temp table from every family in the
-  tree. The actual search on top of that -- the 1-2 `ancestor_map`
+  `all_relationship_paths()` call: ~600-630ms (warm OS page cache),
+  almost entirely spent in `ensure_child_of()` reading every family in
+  the tree. The actual search on top of that -- the 1-2 `ancestor_map`
   calls, walking the chain, wording each node -- adds only a few
   milliseconds, regardless of whether the pair turns out related.
-- `relationships_to()` amortizes that same rebuild across every target
-  in one call instead of paying it per pair: ~9s for all 101,518 people
+- `relationships_to()` amortizes that same read across every target in
+  one call instead of paying it per pair: ~9s for all 101,518 people
   from one root handle (~0.09ms/target after the shared setup cost), vs.
   the ~630ms *each* that many separate `relationship()` calls would cost.
 - `relationship_path()` used to also redo a full `ancestor_map` +
@@ -211,12 +230,39 @@ round-trip latency on top of every number below):
   instead (the same approach `all_relationship_paths()` always used), so
   now every method pays that per-call setup cost exactly once.
 
-`ensure_child_of()`'s temp table is always dropped and rebuilt on every
-top-level call, deliberately never cached across calls -- `restricted`
-doesn't affect its contents (privacy filtering happens later, in
-`ancestor_map()`/`check_spouse()`'s own queries against it), but
-`RelationshipGraph` never sees the actual database connection, only the
-caller's opaque `execute` callable, so it has no reliable way to know
+**Postgres, measured directly against the current DDL-free code** (same
+tree, local connection -- a remote deployment adds real network
+round-trip latency and, more importantly here, the cost of transferring
+the whole edge set across an actual network link rather than loopback):
+
+- A single `relationship()`-style call: `ensure_child_of()` ~1.5-1.6s,
+  `ancestor_map()` ~0.06-0.08ms (everything after the initial load is an
+  in-memory dict walk).
+- `relationships_to()`-style bulk lookup, 300 targets from one root:
+  ~1.6s total load, then all 300 `ancestor_map()` calls together in
+  ~6ms (~0.02ms/target) -- scaling that to the full 101,518-person tree
+  puts the whole sweep at roughly 3.5s.
+- This replaced an earlier version of this module that built a
+  session-scoped SQL temp table with an index on it for the same
+  purpose. That design had a real bug: it never ran `ANALYZE` on the
+  temp table after indexing it, so Postgres -- lacking any statistics on
+  a table that had existed for a few milliseconds -- planned the
+  recursive-CTE lookup as a full sequential scan instead of using the
+  index it had just built. Confirmed directly with `EXPLAIN ANALYZE`:
+  0.26ms with statistics present vs. 291ms without, on the identical
+  query. At `relationships_to()` bulk scale that made the old code
+  roughly 500x slower than it should have been -- an all-tree sweep
+  would have taken on the order of hours, not the ~9s the SQLite numbers
+  above suggest. The current code has no equivalent step to get wrong,
+  since it never creates anything for Postgres to plan a query against
+  in the first place.
+
+`ensure_child_of()` is always reloaded on every top-level call,
+deliberately never cached across calls -- `restricted` doesn't affect its
+contents (privacy filtering happens later, in `ancestor_map()`'s own
+in-memory walk against it), but `RelationshipGraph` never sees the actual
+database connection, only the caller's opaque `execute` callable, so it
+has no reliable way to know
 whether that connection is exclusive to this instance for the duration
 of a call or handed back to a pool afterward. Skipping the rebuild on a
 pooled or multi-tenant (e.g. SharedPostgreSQL) connection risks silently
