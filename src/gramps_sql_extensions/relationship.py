@@ -105,9 +105,15 @@ ExecuteFn = Callable[[str, list], list[tuple]]
 
 
 def _is_birth_path(path: str) -> bool:
-    """A path (e.g. 'ffMf') is birth-only if every hop is lowercase --
-    upper-case codes ('F'/'M') mark a step/adopted/etc. link."""
-    return all(c in ("f", "m") for c in path)
+    """A path (e.g. 'ffMf') is birth-only if it contains none of the
+    three non-birth codes -- 'F'/'M' (a lone step/adopted/etc. parent
+    link) or 'A' (a family-collapsed link, see `_famrel_from_persrel`,
+    where *neither* parent is a birth parent). Port of gramps-core's own
+    `RelationshipCalculator.only_birth`: note that's an exclusion list,
+    not an allow-list, so the other two family codes -- 'a' (both birth
+    parents) and 'b'/'c' (birth via just one side of the family) --
+    count as birth-only too, same as gramps-core."""
+    return not any(c in ("F", "M", "A") for c in path)
 
 
 # ---------------------------------------------------------------------------
@@ -512,22 +518,133 @@ class RelationshipGraph:
         chain.reverse()
         return chain
 
+    @staticmethod
+    def _nearest_common_ancestors(common: set, path1: dict, path2: dict) -> set:
+        """Drop a common ancestor that sits *behind* a nearer one on both
+        people's own routes to it. Mirrors gramps-core's own
+        `__apply_filter`: `other_person`'s search stops the moment a
+        branch crosses into `orig_person`'s known ancestors, so a
+        still-more-distant shared ancestor further up that exact same
+        two-sided route is never even visited there, let alone reported
+        -- whereas this module's BFS happily walks both ancestor maps to
+        `max_depth` independently and then intersects, which finds those
+        farther, redundant ancestors too. A common ancestor `anc2` is
+        redundant here if some *other* common ancestor `anc1` lies on
+        both `anc2`'s route from `h1` and its route from `h2` -- i.e.
+        `path1[anc1]` is a strict prefix of `path1[anc2]` and
+        `path2[anc1]` is a strict prefix of `path2[anc2]`."""
+        redundant = set()
+        for anc2 in common:
+            p1, p2 = path1[anc2], path2[anc2]
+            for anc1 in common:
+                if anc1 is anc2:
+                    continue
+                q1, q2 = path1[anc1], path2[anc1]
+                if len(q1) < len(p1) and len(q2) < len(p2) and p1.startswith(q1) and p2.startswith(q2):
+                    redundant.add(anc2)
+                    break
+        return common - redundant
+
+    def _family_partner(self, anc: str, child: str) -> Optional[str]:
+        """The other parent of `child` in whichever family produced
+        `child`'s parent-link to `anc` -- i.e. `anc`'s spouse in that
+        specific family -- or `None` if there isn't one. Used only as a
+        *candidate* for family-path collapsing (see `_collapsed_paths`);
+        the caller still has to confirm that candidate is itself one of
+        the two people's own common ancestors, reached via this exact
+        pairing, before treating it as anything more than a hypothesis,
+        so this needs no privacy filtering of its own -- an unsafe
+        candidate simply won't pass that later check."""
+        rows = self._execute(
+            """
+            SELECT co2.parent
+            FROM child_of co1
+            JOIN child_of co2
+              ON co2.family_handle = co1.family_handle AND co2.child = co1.child
+            WHERE co1.child = ? AND co1.parent = ? AND co2.parent != co1.parent
+            """,
+            (child, anc),
+        )
+        return rows[0][0] if rows else None
+
+    @staticmethod
+    def _famrel_from_persrel(persrel_a: str, persrel_b: str) -> str:
+        """Port of gramps-core's `RelationshipCalculator._famrel_from_persrel`:
+        combine two parents' single-person path codes ('m'/'f'/'M'/'F')
+        for the same family into one family-level code ('a'/'b'/'c'/'A'),
+        matching `collapse_relations`'s own pairing -- so locale
+        calculators that key off the *last* path character (most
+        non-English ones do, to tell a full relation from a half one)
+        see the two parents as one shared-ancestor family rather than
+        two unrelated single-parent links."""
+        if persrel_a == persrel_b:
+            return persrel_a
+        pair = {persrel_a, persrel_b}
+        if pair == {"m", "f"}:
+            return "a"  # both birth parents: REL_FAM_BIRTH
+        if pair == {"m", "F"}:
+            return "b"  # birth mother, non-birth father: REL_FAM_BIRTH_MOTH_ONLY
+        if pair == {"f", "M"}:
+            return "c"  # birth father, non-birth mother: REL_FAM_BIRTH_FATH_ONLY
+        return "A"  # REL_FAM_NONBIRTH
+
+    def _collapsed_paths(self, anc, dist1, path1, prev1, dist2, path2, prev2, common):
+        """If `anc`'s spouse in the relevant family is *also* a common
+        ancestor of `h1`/`h2` -- reached from both people via that exact
+        same family -- return the family-collapsed `(path_a, path_b,
+        partner)` triple gramps-core's own `collapse_relations` would
+        produce for this pairing: the last hop's lone-parent code
+        ('m'/'f'/'M'/'F') becomes a family code ('a'/'b'/'c'/'A'). Many
+        locale calculators derive "full" vs. "half" relation wording
+        from that last character alone, so without this a shared
+        ancestor *couple* silently reads as a half relation through only
+        one of its two members. Returns `(path1[anc], path2[anc], None)`
+        unchanged when there's no such partner (e.g. `anc` is `h1`
+        itself, or the two routes go through different families)."""
+        path_a, path_b = path1[anc], path2[anc]
+        x1, x2 = prev1.get(anc), prev2.get(anc)
+        if not path_a or not path_b or x1 is None or x2 is None:
+            return path_a, path_b, None
+        partner = self._family_partner(anc, x1)
+        if (
+            partner is None
+            or partner != self._family_partner(anc, x2)
+            or partner not in common
+            or prev1.get(partner) != x1
+            or prev2.get(partner) != x2
+        ):
+            return path_a, path_b, None
+        new_a = path_a[:-1] + self._famrel_from_persrel(path_a[-1], path1[partner][-1])
+        new_b = path_b[:-1] + self._famrel_from_persrel(path_b[-1], path2[partner][-1])
+        return new_a, new_b, partner
+
     # -- shared wording helper ---------------------------------------------
 
-    def _string_for_ancestor(self, h1, h2, anc, dist1, path1, pm1, dist2, path2, pm2, gender1, gender2) -> str:
-        """Relationship wording for one specific common ancestor `anc`.
-        Shared by `relationship()` (single best answer) and
-        `all_relationships()` (every distinct answer) -- both reduce to
-        "given a chosen ancestor, say the relationship it produces"."""
+    def _string_for_ancestor(
+        self, h1, h2, anc, dist1, path1, prev1, pm1, dist2, path2, prev2, pm2, gender1, gender2, common
+    ):
+        """Relationship wording for one specific common ancestor `anc`,
+        as `(relationship_string, collapsed_partner_or_None)`. Shared by
+        `relationship()` (single best answer), `all_relationships()`
+        (every distinct answer), and `_relationship_to()` -- all three
+        reduce to "given a chosen ancestor, say the relationship it
+        produces". `collapsed_partner` is `anc`'s spouse when
+        `_collapsed_paths` folded the two of them into one family-level
+        answer (see there) -- callers that report common ancestors as a
+        list (`all_relationships()`) need it to list both and to skip
+        the partner as a redundant, separate entry of its own; callers
+        that only report the single chosen ancestor can ignore it."""
         Ga, Gb = dist1[anc], dist2[anc]
         if Ga == 1 and Gb == 1:
             sib = self.sibling_type(h1, h2, pm1, pm2)
-            return self._calc.get_sibling_relationship_string(sib, gender1, gender2)
-        only_birth = _is_birth_path(path1[anc]) and _is_birth_path(path2[anc])
-        return self._calc.get_single_relationship_string(
-            Ga, Gb, gender1, gender2, path1[anc], path2[anc],
+            return self._calc.get_sibling_relationship_string(sib, gender1, gender2), None
+        path_a, path_b, partner = self._collapsed_paths(anc, dist1, path1, prev1, dist2, path2, prev2, common)
+        only_birth = _is_birth_path(path_a) and _is_birth_path(path_b)
+        rel_str = self._calc.get_single_relationship_string(
+            Ga, Gb, gender1, gender2, path_a, path_b,
             only_birth=only_birth, in_law_a=False, in_law_b=False,
         )
+        return rel_str, partner
 
     # -- top-level entry points ---------------------------------------------
 
@@ -537,18 +654,21 @@ class RelationshipGraph:
         if h1 == h2:
             return "", -1, -1
 
-        self.ensure_child_of()
-
+        # Checked before ensure_child_of()/ancestor_map(): those build and
+        # query the whole-tree edge table, work a spouse match never needs
+        # and this call is about to return without using anyway.
         spouse = self.check_spouse(h1, h2, restricted)
         if spouse is not None:
             spouse_type, gender1, gender2 = spouse
             rel_str = self._calc.get_partner_relationship_string(spouse_type, gender1, gender2)
             return rel_str, -1, -1
 
+        self.ensure_child_of()
+
         m1 = self.ancestor_map(h1, restricted, max_depth=depth)
         m2 = self.ancestor_map(h2, restricted, max_depth=depth)
-        dist1, path1, pm1 = m1["dist"], m1["path"], m1["parent_of"]
-        dist2, path2, pm2 = m2["dist"], m2["path"], m2["parent_of"]
+        dist1, path1, prev1, pm1 = m1["dist"], m1["path"], m1["prev"], m1["parent_of"]
+        dist2, path2, prev2, pm2 = m2["dist"], m2["path"], m2["prev"], m2["parent_of"]
         common = set(dist1) & set(dist2)
         if not common:
             return "", -1, -1
@@ -556,7 +676,9 @@ class RelationshipGraph:
         best = self._best_common_ancestor(dist1, path1, dist2, path2, common)
         Ga, Gb = dist1[best], dist2[best]
         gender1, gender2 = self.gender(h1), self.gender(h2)
-        rel_str = self._string_for_ancestor(h1, h2, best, dist1, path1, pm1, dist2, path2, pm2, gender1, gender2)
+        rel_str, _partner = self._string_for_ancestor(
+            h1, h2, best, dist1, path1, prev1, pm1, dist2, path2, prev2, pm2, gender1, gender2, common
+        )
         return rel_str, Ga, Gb
 
     def all_relationships(self, h1: str, h2: str, restricted: bool = False, depth: int = 15):
@@ -593,48 +715,65 @@ class RelationshipGraph:
 
         m1 = self.ancestor_map(h1, restricted, max_depth=depth)
         m2 = self.ancestor_map(h2, restricted, max_depth=depth)
-        dist1, path1, pm1 = m1["dist"], m1["path"], m1["parent_of"]
-        dist2, path2, pm2 = m2["dist"], m2["path"], m2["parent_of"]
+        dist1, path1, prev1, pm1 = m1["dist"], m1["path"], m1["prev"], m1["parent_of"]
+        dist2, path2, prev2, pm2 = m2["dist"], m2["path"], m2["prev"], m2["parent_of"]
         common = set(dist1) & set(dist2)
         if not common:
             return result or [{}]
 
+        # Drop ancestors sitting behind a nearer common ancestor on both
+        # people's own routes -- see `_nearest_common_ancestors`.
+        common = self._nearest_common_ancestors(common, path1, path2)
+
         gender1, gender2 = self.gender(h1), self.gender(h2)
         # nearest relationship first, matching "relstrings is ordered on
-        # rank automatic" in gramps-core's own get_all_relationships
-        for anc in sorted(common, key=lambda h: dist1[h] + dist2[h]):
-            rel_str = self._string_for_ancestor(h1, h2, anc, dist1, path1, pm1, dist2, path2, pm2, gender1, gender2)
+        # rank automatic" in gramps-core's own get_all_relationships --
+        # the full tie-break (not just total distance) so iteration order
+        # is deterministic rather than depending on `set` hash order.
+        consumed = set()
+        for anc in sorted(common, key=lambda h: self._ancestor_sort_key(dist1, path1, dist2, path2, h)):
+            if anc in consumed:
+                continue
+            rel_str, partner = self._string_for_ancestor(
+                h1, h2, anc, dist1, path1, prev1, pm1, dist2, path2, prev2, pm2, gender1, gender2, common
+            )
+            handles = [anc] if partner is None else [anc, partner]
+            if partner is not None:
+                consumed.add(partner)
             if rel_str in seen:
-                result[seen[rel_str]]["common_ancestors"].append(anc)
+                result[seen[rel_str]]["common_ancestors"].extend(handles)
             else:
                 seen[rel_str] = len(result)
-                result.append({"relationship_string": rel_str, "common_ancestors": [anc]})
+                result.append({"relationship_string": rel_str, "common_ancestors": handles})
 
         return result or [{}]
 
-    def _relationship_to(self, h1: str, other: str, restricted: bool, depth: int, dist1, path1, pm1) -> str:
+    def _relationship_to(self, h1: str, other: str, restricted: bool, depth: int, dist1, path1, prev1, pm1) -> str:
         """Relationship of `other` to `h1`, reusing `h1`'s already-built
-        ancestor map (`dist1`/`path1`/`pm1`) rather than recomputing it --
-        the piece of `relationship()` that's expensive per call. Only
-        `other`'s own map is fetched fresh each call, since -- unlike
-        `relationship_path`/`all_relationship_paths`, where every node is
-        already known to sit on a specific, already-computed chain --
-        `relationships_to` calls this for arbitrary target handles with
-        no such shortcut available."""
+        ancestor map (`dist1`/`path1`/`prev1`/`pm1`) rather than
+        recomputing it -- the piece of `relationship()` that's expensive
+        per call. Only `other`'s own map is fetched fresh each call,
+        since -- unlike `relationship_path`/`all_relationship_paths`,
+        where every node is already known to sit on a specific,
+        already-computed chain -- `relationships_to` calls this for
+        arbitrary target handles with no such shortcut available."""
         spouse = self.check_spouse(h1, other, restricted)
         if spouse is not None:
             spouse_type, gender1, gender2 = spouse
             return self._calc.get_partner_relationship_string(spouse_type, gender1, gender2)
 
         m2 = self.ancestor_map(other, restricted, max_depth=depth)
-        dist2, path2, pm2 = m2["dist"], m2["path"], m2["parent_of"]
+        dist2, path2, prev2, pm2 = m2["dist"], m2["path"], m2["prev"], m2["parent_of"]
         common = set(dist1) & set(dist2)
         if not common:
             return ""
 
         anc = self._best_common_ancestor(dist1, path1, dist2, path2, common)
         gender1, gender2 = self.gender(h1), self.gender(other)
-        return self._string_for_ancestor(h1, other, anc, dist1, path1, pm1, dist2, path2, pm2, gender1, gender2)
+        rel_str, _partner = self._string_for_ancestor(
+            h1, other, anc, dist1, path1, prev1, pm1, dist2, path2, prev2, pm2, gender1, gender2, common
+        )
+        return rel_str
 
     def _label_direct_ancestor(self, h1: str, node: str, dist1, path1, gender1: int) -> str:
         """Relationship to `h1` of `node`, one of `h1`'s own ancestors
@@ -649,18 +788,25 @@ class RelationshipGraph:
             only_birth=only_birth, in_law_a=False, in_law_b=False,
         )
 
-    def _label_via_ancestor(self, h1: str, other: str, anc: str, dist1, path1, pm1, dist2, path2, pm2, gender1: int) -> str:
+    def _label_via_ancestor(
+        self, h1: str, other: str, anc: str, dist1, path1, prev1, pm1, dist2, path2, prev2, pm2, common, gender1: int
+    ) -> str:
         """Relationship to `h1` of `other`, an ancestor of `h2` (or `h2`
         itself) sitting on `h2`'s shortest BFS route to the specific
         common ancestor `anc`. `other`'s own up-path to `anc` is the tail
         of `anc`'s own `path2`/distance beyond `other`'s -- valid only
         because `other` sits on that exact route (true for every node
         `all_relationship_paths`/`relationship_path` ever call this for),
-        not for an arbitrary pair of ancestors in the map."""
+        not for an arbitrary pair of ancestors in the map. `anc`'s path
+        pair is run through the same family-collapsing as
+        `_string_for_ancestor` (see `_collapsed_paths`) before the
+        `other`-relative tail is cut from it, so a shared-ancestor
+        *couple* reads correctly here too, not just at the chain's `h2`
+        endpoint."""
         Ga = dist1[anc]
         Gb = dist2[anc] - dist2[other]
-        path_a = path1[anc]
-        path_b = path2[anc][len(path2[other]):]
+        path_a, full_path_b, _partner = self._collapsed_paths(anc, dist1, path1, prev1, dist2, path2, prev2, common)
+        path_b = full_path_b[len(path2[other]):]
         gender_other = self.gender(other)
         if Ga == 1 and Gb == 1:
             sib = self.sibling_type(h1, other, pm1, pm2)
@@ -699,16 +845,19 @@ class RelationshipGraph:
         if h1 == h2:
             return [{"handle": h1, "relationship_string": ""}]
 
-        self.ensure_child_of()
-
         result = [{"handle": h1, "relationship_string": ""}]
 
+        # Checked before ensure_child_of()/ancestor_map(): those build and
+        # query the whole-tree edge table, work a spouse match never needs
+        # and this call is about to return without using anyway.
         spouse = self.check_spouse(h1, h2, restricted)
         if spouse is not None:
             spouse_type, gender1, gender2 = spouse
             rel_str = self._calc.get_partner_relationship_string(spouse_type, gender1, gender2)
             result.append({"handle": h2, "relationship_string": rel_str})
             return result
+
+        self.ensure_child_of()
 
         m1 = self.ancestor_map(h1, restricted, max_depth=depth)
         m2 = self.ancestor_map(h2, restricted, max_depth=depth)
@@ -726,7 +875,9 @@ class RelationshipGraph:
             rel_str = self._label_direct_ancestor(h1, node, dist1, path1, gender1)
             result.append({"handle": node, "relationship_string": rel_str})
         for node in reversed(chain2[:-1]):
-            rel_str = self._label_via_ancestor(h1, node, anc, dist1, path1, pm1, dist2, path2, pm2, gender1)
+            rel_str = self._label_via_ancestor(
+                h1, node, anc, dist1, path1, prev1, pm1, dist2, path2, prev2, pm2, common, gender1
+            )
             result.append({"handle": node, "relationship_string": rel_str})
 
         return result
@@ -794,6 +945,14 @@ class RelationshipGraph:
         if not common:
             return paths
 
+        # Drop ancestors sitting behind a nearer common ancestor on both
+        # people's own routes -- see `_nearest_common_ancestors`. Without
+        # this, pedigree collapse at generation N would spuriously also
+        # report every one of that ancestor's own ancestors (through
+        # generation `depth`) as if they were separate, more-distant
+        # relationships, when gramps-core's own search never visits them.
+        common = self._nearest_common_ancestors(common, path1, path2)
+
         gender1 = self.gender(h1)
         ancestors = sorted(common, key=lambda h: self._ancestor_sort_key(dist1, path1, dist2, path2, h))
         if max_paths is not None:
@@ -807,7 +966,9 @@ class RelationshipGraph:
                 rel_str = self._label_direct_ancestor(h1, node, dist1, path1, gender1)
                 path.append({"handle": node, "relationship_string": rel_str})
             for node in reversed(chain2[:-1]):
-                rel_str = self._label_via_ancestor(h1, node, anc, dist1, path1, pm1, dist2, path2, pm2, gender1)
+                rel_str = self._label_via_ancestor(
+                    h1, node, anc, dist1, path1, prev1, pm1, dist2, path2, prev2, pm2, common, gender1
+                )
                 path.append({"handle": node, "relationship_string": rel_str})
 
             paths.append(path)
@@ -902,14 +1063,14 @@ class RelationshipGraph:
             target_handles = target_handles[offset : offset + pagesize]
 
         m1 = self.ancestor_map(h1, restricted, max_depth=depth)
-        dist1, path1, pm1 = m1["dist"], m1["path"], m1["parent_of"]
+        dist1, path1, prev1, pm1 = m1["dist"], m1["path"], m1["prev"], m1["parent_of"]
 
         items = []
         for other in target_handles:
             if other == h1:
                 rel_str = ""
             else:
-                rel_str = self._relationship_to(h1, other, restricted, depth, dist1, path1, pm1)
+                rel_str = self._relationship_to(h1, other, restricted, depth, dist1, path1, prev1, pm1)
             items.append({"handle": other, "relationship_string": rel_str})
 
         return {"items": items, "total": total, "page": page, "pagesize": pagesize}

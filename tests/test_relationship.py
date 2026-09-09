@@ -61,6 +61,52 @@ def test_all_relationships_expected_result(graph):
     result = graph.all_relationships("9BXKQC1PVLPYFMD6IX", "ORFKQC4KLWEGTGR19L")
     assert "common_ancestors" in result[0]
     assert result[0]["relationship_string"] == "second great stepgrandaunt"
+    # a single entry: gramps-core's own get_all_relationships() finds one
+    # relationship for this pair too, not several -- see
+    # test_all_relationships_no_overreporting for the bug this guards.
+    assert len(result) == 1
+    assert len(result[0]["common_ancestors"]) == 2
+
+
+def test_all_relationships_no_overreporting(graph):
+    """A common ancestor sitting *behind* a nearer one on both people's
+    own routes to it (here, the nearer ancestor couple's own further
+    ancestors) must not be reported as if it were a separate, more
+    distant relationship -- gramps-core's own search never visits it in
+    the first place (RelationshipCalculator.__apply_filter stops each
+    branch at the first common ancestor it crosses), so this pair has
+    exactly one true relationship, not a dozen "Nth cousin" phantoms."""
+    result = graph.all_relationships("2ZZJQC5SE4U66ZPIVW", "WBWJQCBR1TOBGJI68G")
+    assert len(result) == 1
+    assert result[0]["relationship_string"] == "second cousin"
+    assert set(result[0]["common_ancestors"]) == {
+        "9GUJQCBJMTV7R6EJU",
+        "ENTJQCZXQV1IRKJXUL",
+    }
+
+
+def test_all_relationships_order_is_deterministic(graph):
+    """Entries must be ordered by the same full tie-break
+    `all_relationship_paths` uses, not a bare distance sum -- a bare sum
+    leaves ties broken by `set` iteration order, which is
+    hash-seed-dependent and not stable across processes."""
+    h1, h2 = "9BXKQC1PVLPYFMD6IX", "ORFKQC4KLWEGTGR19L"
+    first = graph.all_relationships(h1, h2)
+    for _ in range(5):
+        assert graph.all_relationships(h1, h2) == first
+
+
+def test_relationship_locale_full_vs_half(make_graph):
+    """A shared ancestor *couple* (both members of a marriage are common
+    ancestors) must read as a full relation, not a half one -- several
+    locale calculators (e.g. rel_de.py) derive "full" vs. "half" wording
+    from whether the relationship path's last hop reaches a whole family
+    or just one lone parent, so failing to collapse the two parents'
+    separate paths into one family-level path silently turns every such
+    "cousin" into a "Halbcousin" (half cousin)."""
+    graph_de = make_graph("de_DE.UTF-8")
+    rel_str, _, _ = graph_de.relationship("2ZZJQC5SE4U66ZPIVW", "WBWJQCBR1TOBGJI68G")
+    assert rel_str == "Cousin zweiten Grades"
 
 
 def test_all_relationships_same_person(graph):
@@ -126,9 +172,10 @@ def test_relationship_path_partner(graph):
 def test_all_relationship_paths_expected_result(graph):
     h1, h2 = "9BXKQC1PVLPYFMD6IX", "ORFKQC4KLWEGTGR19L"
     paths = graph.all_relationship_paths(h1, h2)
-    # 6 distinct common ancestors -> 6 distinct paths, matching the 6
-    # ancestors all_relationships() groups into its 2 wording buckets
-    assert len(paths) == 6
+    # 2 distinct common ancestors (a couple, both members) -> 2 distinct
+    # physical routes, even though all_relationships() groups them into
+    # a single wording bucket (see test_all_relationships_expected_result)
+    assert len(paths) == 2
     # nearest-first, and the very first path always matches the single
     # "best" answer relationship_path()/relationship() report
     assert paths[0] == graph.relationship_path(h1, h2)
@@ -137,6 +184,17 @@ def test_all_relationship_paths_expected_result(graph):
     for path in paths:
         assert path[0] == {"handle": h1, "relationship_string": ""}
         assert path[-1]["handle"] == h2
+
+
+def test_all_relationship_paths_no_overreporting(graph):
+    """Same guard as test_all_relationships_no_overreporting, at the
+    per-path level: exactly the two physical routes through the shared
+    ancestor couple, not a phantom "path" for every generation further
+    up that couple's own line gramps-core's search never even visits."""
+    h1, h2 = "2ZZJQC5SE4U66ZPIVW", "WBWJQCBR1TOBGJI68G"
+    paths = graph.all_relationship_paths(h1, h2)
+    assert len(paths) == 2
+    assert {path[-1]["relationship_string"] for path in paths} == {"second cousin"}
 
 
 def test_all_relationship_paths_max_paths(graph):
@@ -281,6 +339,33 @@ def test_ancestor_map_respects_privacy(privacy_graph):
     # the other, non-private parent stays visible either way
     assert h["father1"] in m_open["dist"]
     assert h["father1"] in m_restricted["dist"]
+
+
+def test_relationship_spouse_skips_child_of_table(example_execute):
+    """A spouse lookup must resolve via check_spouse() alone, without
+    ever building the whole-tree `child_of` edge table -- the expensive
+    part of relationship()/relationship_path() that a spouse match has
+    no use for. Verified by wrapping `execute` to record every statement
+    and asserting none of them touches `child_of`."""
+    from gramps_sql_extensions import RelationshipGraph
+
+    statements = []
+
+    def spying_execute(sql, params):
+        statements.append(sql)
+        return example_execute(sql, params)
+
+    graph = RelationshipGraph(spying_execute, dialect="sqlite")
+    h1, h2 = "cc8205d87831c772e87", "cc8205d872f532ab14e"
+
+    rel_str, _, _ = graph.relationship(h1, h2)
+    assert rel_str == "husband"
+    assert not any("child_of" in sql for sql in statements)
+
+    statements.clear()
+    path = graph.relationship_path(h1, h2)
+    assert path[-1]["relationship_string"] == "husband"
+    assert not any("child_of" in sql for sql in statements)
 
 
 def test_reused_connection_across_calls(graph):
