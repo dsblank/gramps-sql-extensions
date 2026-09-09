@@ -11,4 +11,4 @@ from .relationship import RelationshipGraph, ExecuteFn, DIALECTS
 
 __all__ = ["RelationshipGraph", "ExecuteFn", "DIALECTS"]
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"

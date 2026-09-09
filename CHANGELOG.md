@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-09-09
+
+### Fixed
+
+- `ensure_child_of()` no longer builds a session-scoped SQL temp table
+  (`DROP TABLE`/`CREATE TEMP TABLE`/`CREATE INDEX`); it loads every
+  parent/child edge into the `RelationshipGraph` instance's own Python
+  memory via a single plain `SELECT` instead, and `ancestor_map()`/
+  the shared-ancestor-couple lookup walk that in-memory index rather
+  than issuing further SQL. This removes all DDL from the module, so it
+  now works against a connection that's genuinely read-only at the
+  database/role level, not just one where "read-only" is an unenforced
+  application-level convention (as with Gramps' own
+  `DbGeneric.load(..., readonly=True)`).
+- Along the way, this also fixes a real performance bug in the old
+  design: the temp table was never `ANALYZE`d after being indexed, so
+  Postgres planned the recursive-CTE lookup as a full sequential scan
+  instead of using the index it had just built (confirmed via `EXPLAIN
+  ANALYZE`: 291ms vs. 0.26ms on the identical query against the real
+  101,518-person/46,315-family tree used for this project's benchmarks).
+  At `relationships_to()` bulk scale that made the shipped code roughly
+  500x slower than intended -- an all-tree sweep that should take
+  seconds was instead taking hours. The new in-memory design has no
+  equivalent step to get wrong, and measures faster than even a
+  correctly-`ANALYZE`d version of the old one.
+
 ## [0.2.1] - 2026-09-09
 
 ### Fixed
