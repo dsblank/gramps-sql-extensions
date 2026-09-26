@@ -1,3 +1,13 @@
+This particular set of methods related to relationships was better implemented in Python.
+
+A fix using many ideas and tests from here was proposed to gramps-core:
+
+https://github.com/gramps-project/gramps/pull/2526
+
+And an independent version with all of the extra functions is here:
+
+https://github.com/gramps-project/addons-source/pull/1036
+
 # gramps-sql-extensions
 
 A collection of SQL-accelerated implementations of operations Gramps
